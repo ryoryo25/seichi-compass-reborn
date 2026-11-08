@@ -1,0 +1,19 @@
+{
+  "name": "seichi-compass-reborn",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace=@seichi/web",
+    "build": "npm run build --workspace=@seichi/web",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "seed:kml": "node --experimental-strip-types scripts/build-seed-from-kml.ts"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}

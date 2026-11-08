@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+.next/
+out/
+dist/
+build/
+*.tsbuildinfo
+
+# Local runtime state & raw external imports
+data/*.kml
+data/*.kmz
+.local-data/
+
+# Env
+.env
+.env.*
+!.env.example
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/

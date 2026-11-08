@@ -1,6 +1,6 @@
 {
   "name": "seichi-compass-reborn",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "workspaces": [
@@ -9,9 +9,15 @@
   ],
   "scripts": {
     "dev": "npm run dev --workspace=@seichi/web",
+    "dev:api": "npm run dev --workspace=@seichi/api",
+    "dev:mobile": "npm run dev --workspace=@seichi/mobile",
     "build": "npm run build --workspace=@seichi/web",
+    "test": "npm run test --workspace=@seichi/shared",
     "typecheck": "npm run typecheck --workspaces --if-present",
-    "seed:kml": "node --experimental-strip-types scripts/build-seed-from-kml.ts"
+    "db:push": "npm run db:push --workspace=@seichi/db",
+    "db:seed": "node --experimental-strip-types scripts/seed-neon.ts",
+    "seed:kml": "node --experimental-strip-types scripts/build-seed-from-kml.ts",
+    "deploy:api": "npm run deploy --workspace=@seichi/api"
   },
   "engines": {
     "node": ">=22.0.0"

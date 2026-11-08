@@ -1,31 +1,33 @@
-# 聖地コンパス Reborn (Seichi Compass Reborn) — Architecture
+# 聖地コンパス Reborn — Production Architecture
 
-## 概要
-「推しの聖地・ロケ地巡りに宝探しゲームのワクワクを」をコンセプトにした **聖地コンパス** のリメイク版モノレポです。
-初期ターゲットとして **日向坂46** の聖地巡礼体験に最適化しつつ、`groupId` による将来の多グループ・他ジャンル展開に対応した設計となっています。
+## 1. システム全体像
 
-## モノレポ構成
-- `packages/shared`: Web・API・将来のモバイルアプリ（Expo）で共有するコアロジック
-  - Zod スキーマ・型定義 (`schemas.ts`)
-  - スポットIDシード固定・段階的虫食いタイトル生成エンジン (`masking.ts`)
-  - 距離・コンパス方位角・ぼかしレーダー円・都道府県推定 (`geo.ts`)
-  - 日向坂46メンバーマスタ＆説明文からの自動タグ抽出 (`members.ts`)
-  - Google Maps URL 座標解析・参考URL安全性検証・YouTube秒数抽出 (`url-parser.ts`)
-  - Googleマイマップ KML / CSV 構造化インポーター＆近接スポット自動統合 (`kml-importer.ts`)
-- `packages/db`: データ永続化層
-  - 本番用 **Neon (PostgreSQL + PostGIS) + Drizzle ORM + Better Auth** スキーマ定義 (`schema.ts`)
-  - プロトタイプが外部クラウド認証情報なしで即動作するローカルリポジトリ実装 (`local-store.ts`)
-  - Googleマイマップから構造化・重複統合した初期シードデータ (`seed/hinatazaka-spots.json`)
-- `apps/web`: **Next.js (App Router) + Hono RPC API**
-  - コンパス探索（リアルGPS/磁気センサー ＋ PC検証用デモ位置シミュレーター）
-  - 宝探しレーダーマップ ＆ 通常聖地マップ融合ビュー（`<SeichiMap />` アダプタによる MapLibre GL 実装、将来 Google Maps SDK 差替対応）
-  - 聖地・エピソード追加（Google Maps URL解析、ミニマップでのピンドラッグ微調整、半径50m重複検知サジェスト）
-  - 自分専用の非公開巡礼アルバム ＋ 到着者限定ひとことコメント ＋ 実績・難易度カスタマイズ設定
-  - 管理者向け KML / CSV 一括インポート機能
-- `apps/mobile` *(Phase 2 予定)*: **Expo (React Native)** iOS / Android アプリ（バックグラウンド Geofencing 接近通知、共有シート連携）
+```
+[Web Browser (Next.js 15)]          [iOS / Android App (Expo SDK 53)]
+  ├─ Web Compass / Geolocation        ├─ 60fps Magnetometer + GPS + Haptics
+  ├─ <SeichiMap /> (MapLibre GL)      ├─ <MapView /> (Apple / Google Maps)
+  ├─ OGP Share (/spots/[id])          ├─ OS Geofencing (power_save / out_and_about)
+  └─ Cookie Session                   └─ SecureStore Bearer Token + Share Sheet URL
+                 \                           /
+                  v                         v
+        [@seichi/api — Hono RPC API (Cloudflare Workers / Next Route)]
+          ├─ Auth: Anonymous Guest Session -> Email / OAuth Merge (Better Auth)
+          ├─ Geocoder: Google Maps Short-URL Resolver + Places API / 国土地理院 Fallback
+          ├─ Domain: @seichi/shared (Seeded Masking, SSRF Guard, KML/CSV Importer)
+          ├─ Spatial DB: @seichi/db -> Neon PostgreSQL + PostGIS (GiST ST_DWithin / KNN)
+          └─ Private Storage: Cloudflare R2 (ALBUM_BUCKET, Owner-Only Auth Check)
+```
 
-## 本番クラウド構成（ターゲット）
-- **API & Web**: Cloudflare Workers (Hono RPC + OpenNext)
-- **Database**: Neon Serverless PostgreSQL + PostGIS
-- **Auth**: Better Auth（ゲスト匿名セッション → X / Google / Apple アカウント連携引き継ぎ）
-- **Private Storage**: Cloudflare R2（自分専用の巡礼アルバム写真のみ非公開保管）
+## 2. コアドメイン設計のポイント
+
+### ネタバレ防止（座標非漏洩 ＆ 決定論的シード伏せ字）
+- **決定論的虫食いマスク (`maskSpotTitle`)**: `spotId` から生成した FNV-1a + Mulberry32 乱数で各文字の開示優先順位を固定。リロードしても別の文字が漏れず、`full ⊂ hard ⊂ normal ⊂ easy` の単調開示が数学的に保証されます。
+- **未訪問座標の秘匿 (`radarLat` / `radarLng`)**: `treasure` モード時は未訪問スポットの真の座標 (`exactLat`/`exactLng`) をAPIレスポンスから除外し、120〜380mオフセットした決定論的レーダー中心座標とサーバー計算距離のみを返却します。モバイルの省電力OSジオフェンスでもこの `radarLat`/`radarLng` を中心に `380m + 通知半径` の領域を張ることで、通信傍受による座標特定を防ぎながら確実な接近通知を実現しています。
+
+### 1スポット × 複数登場シーン構造 ＆ 二重登録防止
+- 同一施設でMV・冠番組・ブログなど複数回登場するケースに対応するため、`spots`（物理場所）と `spot_episodes`（登場シーン）を `1:N` で分離。
+- 新規登録時およびKML/CSV一括インポート時に半径 `60m` 以内の近接スポットを PostGIS `ST_DWithin` で高速検索し、新規ピン乱立ではなく既存スポットへのエピソード追記へ誘導します。
+
+### 著作権・プライバシー保護
+- **公式コンテンツへの還元**: 公式画像やキャプチャの転載機能を持たせず、HTTPS検証済みの公式YouTube（再生開始秒数パラメータ対応）・公式ブログURLへの誘導に特化。
+- **完全非公開の巡礼アルバム**: ユーザーが現地で撮影した記念写真は Cloudflare R2 非公開バケット (`ALBUM_BUCKET`) に格納され、`/api/me/visits/:spotId/photo` にてセッションオーナー本人のみが取得可能です。他ユーザーには一切露出せず、ゲストから本登録へ連携した際も `mergeAnonymousUserData` によりR2キーごと引き継がれます。

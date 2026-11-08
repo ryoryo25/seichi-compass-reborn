@@ -1,0 +1,70 @@
+{
+  "expo": {
+    "name": "聖地コンパス Reborn",
+    "slug": "seichi-compass-reborn",
+    "version": "0.2.0",
+    "orientation": "portrait",
+    "scheme": "seichicompass",
+    "userInterfaceStyle": "light",
+    "newArchEnabled": true,
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "jp.seichicompass.reborn",
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription": "現在地から聖地までの距離・コンパス方位の計算と到着判定に使用します。",
+        "NSLocationAlwaysAndWhenInUseUsageDescription": "お出かけ中に未訪問の聖地が近くにある際、バックグラウンドで通知をお届けするために使用します。",
+        "NSCameraUsageDescription": "聖地に到着した記念写真を自分専用の非公開アルバムに記録するために使用します。",
+        "NSPhotoLibraryUsageDescription": "聖地巡礼の記念写真を自分専用の非公開アルバムに保存するために使用します。",
+        "UIBackgroundModes": ["location", "fetch"]
+      }
+    },
+    "android": {
+      "package": "jp.seichicompass.reborn",
+      "permissions": [
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_BACKGROUND_LOCATION",
+        "VIBRATE",
+        "RECEIVE_BOOT_COMPLETED"
+      ],
+      "intentFilters": [
+        {
+          "action": "VIEW",
+          "autoVerify": true,
+          "data": [
+            {
+              "scheme": "seichicompass"
+            },
+            {
+              "scheme": "https",
+              "host": "maps.app.goo.gl"
+            },
+            {
+              "scheme": "https",
+              "host": "www.google.com",
+              "pathPrefix": "/maps"
+            }
+          ],
+          "category": ["BROWSABLE", "DEFAULT"]
+        }
+      ]
+    },
+    "plugins": [
+      "expo-router",
+      "expo-secure-store",
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "お出かけ中に未訪問の聖地が近くにある際、バックグラウンドで通知をお届けするために使用します。",
+          "isIosBackgroundLocationEnabled": true,
+          "isAndroidBackgroundLocationEnabled": true
+        }
+      ],
+      "expo-notifications",
+      "expo-image-picker"
+    ],
+    "experiments": {
+      "typedRoutes": false
+    }
+  }
+}

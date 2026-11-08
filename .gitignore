@@ -1,8 +1,10 @@
 # Dependencies
 node_modules/
 
-# Build outputs
+# Build & platform outputs
 .next/
+.expo/
+.wrangler/
 out/
 dist/
 build/

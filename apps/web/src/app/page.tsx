@@ -1,6 +1,7 @@
 'use client';
 
 import {
+  type AuthUser,
   type ExplorerSettings,
   ExplorerSettingsSchema,
   formatDistance,
@@ -10,6 +11,7 @@ import {
   type MediaCategory,
   type Spot,
   type SpotComment,
+  type VisitRecord,
 } from '@seichi/shared';
 import {
   Award,
@@ -23,24 +25,15 @@ import {
   Search,
   ShieldCheck,
   UserCheck,
-  UserRound,
+  UserPlus,
 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { AuthModal } from '@/components/auth/AuthModal';
 import { CompassView } from '@/components/compass/CompassView';
 import { SeichiMap } from '@/components/map/SeichiMap';
 import { ProfileSettingsPanel } from '@/components/profile/ProfileSettingsPanel';
 import { RegisterSpotPanel } from '@/components/register/RegisterSpotPanel';
 import { SpotDetailModal } from '@/components/spot/SpotDetailModal';
-import {
-  type LocalVisitEntry,
-  loadExplorerSettings,
-  loadUserRole,
-  loadVisitBook,
-  saveExplorerSettings,
-  saveUserRole,
-  saveVisitBook,
-  type UserRole,
-} from '@/lib/storage';
 
 type TabKey = 'explore' | 'map' | 'register' | 'profile';
 
@@ -58,43 +51,55 @@ const DEMO_LOCATION_PRESETS: ReadonlyArray<{
 
 export default function HomePage() {
   const [activeTab, setActiveTab] = useState<TabKey>('explore');
-  const [hydrated, setHydrated] = useState(false);
+  const [sessionReady, setSessionReady] = useState(false);
 
-  // ユーザー設定・訪問ブック・権限ロール
+  // サーバー同期された認証ユーザー & 訪問記録
+  const [currentUser, setCurrentUser] = useState<AuthUser | null>(null);
   const [settings, setSettings] = useState<ExplorerSettings>(() =>
     ExplorerSettingsSchema.parse({}),
   );
-  const [visitBook, setVisitBook] = useState<Record<string, LocalVisitEntry>>({});
-  const [userRole, setUserRole] = useState<UserRole>('user');
+  const [visitBook, setVisitBook] = useState<Record<string, VisitRecord>>({});
+  const [showAuthModal, setShowAuthModal] = useState(false);
 
-  // 位置情報 & デモシミュレーター
+  // 位置情報 & シミュレーター
   const [isDemoMode, setIsDemoMode] = useState(true);
-  const [showSimulatorBar, setShowSimulatorBar] = useState(true);
+  const [showSimulatorBar, setShowSimulatorBar] = useState(false);
   const [userLat, setUserLat] = useState(DEMO_LOCATION_PRESETS[0]!.lat);
   const [userLng, setUserLng] = useState(DEMO_LOCATION_PRESETS[0]!.lng);
   const [deviceHeadingDeg, setDeviceHeadingDeg] = useState(0);
 
-  // メタ情報 & 検索フィルタ
+  // メタ情報 & 機能フラグ
   const [meta, setMeta] = useState<{
     totalSpots: number;
     totalEpisodes: number;
     prefectures: Array<{ prefecture: string; totalSpots: number }>;
-  }>({ totalSpots: 0, totalEpisodes: 0, prefectures: [] });
+    oauthProviders: { twitter: boolean; google: boolean; apple: boolean };
+    allowDevRoleSwitch: boolean;
+    enableDemoSimulator: boolean;
+  }>({
+    totalSpots: 0,
+    totalEpisodes: 0,
+    prefectures: [],
+    oauthProviders: { twitter: false, google: false, apple: false },
+    allowDevRoleSwitch: true,
+    enableDemoSimulator: true,
+  });
 
+  // 検索フィルタ
   const [filterMember, setFilterMember] = useState('');
   const [filterCategory, setFilterCategory] = useState<MediaCategory | ''>('');
   const [filterPrefecture, setFilterPrefecture] = useState('');
   const [tagQuery, setTagQuery] = useState('');
   const [onlyUnvisited, setOnlyUnvisited] = useState(false);
 
-  // 取得した周辺スポット一覧 & 選択中コンパス対象
+  // 周辺スポット & 選択中コンパス
   const [spots, setSpots] = useState<MaskedSpotSummary[]>([]);
   const [loadingSpots, setLoadingSpots] = useState(true);
   const [selectedCompassSpotId, setSelectedCompassSpotId] = useState<string | null>(
     null,
   );
 
-  // 解禁モーダル状態
+  // 解禁モーダル
   const [unlockedModalData, setUnlockedModalData] = useState<{
     spot: Spot;
     comments: SpotComment[];
@@ -102,30 +107,55 @@ export default function HomePage() {
   const [unlockError, setUnlockError] = useState<string | null>(null);
   const [isUnlocking, setIsUnlocking] = useState(false);
 
-  // 接近プッシュ通知トースト（クールダウン管理付き）
+  // 接近通知クールダウン
   const notifiedSpotTimestamps = useRef<Record<string, number>>({});
   const [proximityToastSpot, setProximityToastSpot] =
     useState<MaskedSpotSummary | null>(null);
 
-  // 初期ストレージ読込
+  // URL クエリ (?compass=spot_id) からのコンパス直接起動
   useEffect(() => {
-    setSettings(loadExplorerSettings());
-    setVisitBook(loadVisitBook());
-    setUserRole(loadUserRole());
-    setHydrated(true);
+    if (typeof window === 'undefined') return;
+    const params = new URLSearchParams(window.location.search);
+    const compassTarget = params.get('compass');
+    if (compassTarget) {
+      setSelectedCompassSpotId(compassTarget);
+      setActiveTab('explore');
+    }
   }, []);
 
-  // メタデータ取得
+  // 1. セッション初期化（ゲスト匿名セッション自動発行または既存セッション復元）
+  const initSession = useCallback(async () => {
+    try {
+      const res = await fetch('/api/auth/session', { method: 'POST' });
+      if (res.ok) {
+        const data = (await res.json()) as {
+          user: AuthUser;
+          visits: Record<string, VisitRecord>;
+        };
+        setCurrentUser(data.user);
+        setSettings(data.user.settings);
+        setVisitBook(data.visits);
+      }
+    } finally {
+      setSessionReady(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    initSession();
+  }, [initSession]);
+
+  // 2. メタデータ取得
   const fetchMeta = useCallback(async () => {
     try {
       const res = await fetch('/api/meta');
       if (!res.ok) return;
-      const data = (await res.json()) as {
-        totalSpots: number;
-        totalEpisodes: number;
-        prefectures: Array<{ prefecture: string; totalSpots: number }>;
-      };
+      const data = await res.json();
       setMeta(data);
+      if (!data.enableDemoSimulator) {
+        setIsDemoMode(false);
+        setShowSimulatorBar(false);
+      }
     } catch {
       // ignore
     }
@@ -135,7 +165,7 @@ export default function HomePage() {
     fetchMeta();
   }, [fetchMeta]);
 
-  // リアルGPS & 磁気コンパス購読（isDemoMode === false の時）
+  // 3. リアルGPS & 磁気コンパス購読
   useEffect(() => {
     if (isDemoMode || typeof window === 'undefined') return;
 
@@ -146,9 +176,7 @@ export default function HomePage() {
           setUserLat(Number(pos.coords.latitude.toFixed(6)));
           setUserLng(Number(pos.coords.longitude.toFixed(6)));
         },
-        () => {
-          // 権限拒否時などはデモ座標を維持
-        },
+        () => {},
         { enableHighAccuracy: true, maximumAge: 5000 },
       );
     }
@@ -171,22 +199,11 @@ export default function HomePage() {
     };
   }, [isDemoMode]);
 
-  // 周辺スポット一覧の取得
+  // 4. 周辺スポット検索（サーバー上の訪問状態と自動統合）
   const fetchSpots = useCallback(async () => {
-    if (!hydrated) return;
+    if (!sessionReady) return;
     setLoadingSpots(true);
     try {
-      const unlockedMap: Record<
-        string,
-        { status: 'visited' | 'give_up'; selfDiscovered?: boolean }
-      > = {};
-      for (const [id, entry] of Object.entries(visitBook)) {
-        unlockedMap[id] = {
-          status: entry.status,
-          selfDiscovered: entry.selfDiscovered,
-        };
-      }
-
       const res = await fetch('/api/spots/search', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -201,7 +218,6 @@ export default function HomePage() {
           maskLevel: settings.maskLevel,
           tagVisibility: settings.tagVisibility,
           mapMode: settings.mapMode,
-          unlockedMap,
         }),
       });
       if (!res.ok) return;
@@ -211,7 +227,7 @@ export default function HomePage() {
       setLoadingSpots(false);
     }
   }, [
-    hydrated,
+    sessionReady,
     userLat,
     userLng,
     filterMember,
@@ -228,9 +244,9 @@ export default function HomePage() {
     fetchSpots();
   }, [fetchSpots]);
 
-  // 接近プッシュ通知判定（スライド35〜38の体験再現）
+  // 5. 接近通知検知
   useEffect(() => {
-    if (!hydrated || settings.notificationMode === 'off' || spots.length === 0) {
+    if (!sessionReady || settings.notificationMode === 'off' || spots.length === 0) {
       return;
     }
     const now = Date.now();
@@ -254,7 +270,7 @@ export default function HomePage() {
       setProximityToastSpot(candidate);
     }
   }, [
-    hydrated,
+    sessionReady,
     spots,
     settings.notificationMode,
     settings.notificationRadiusMeters,
@@ -273,14 +289,36 @@ export default function HomePage() {
     return spots.find((s) => s.id === selectedCompassSpotId) ?? null;
   }, [spots, selectedCompassSpotId]);
 
-  const handleUpdateSettings = (next: ExplorerSettings) => {
+  const handleUpdateSettings = async (next: ExplorerSettings) => {
     setSettings(next);
-    saveExplorerSettings(next);
+    const res = await fetch('/api/me/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(next),
+    });
+    if (res.ok) {
+      const data = (await res.json()) as { user: AuthUser };
+      setCurrentUser(data.user);
+    }
   };
 
-  const handleChangeRole = (nextRole: UserRole) => {
-    setUserRole(nextRole);
-    saveUserRole(nextRole);
+  const handleToggleAdminForDev = async () => {
+    if (!currentUser) return;
+    const nextRole = currentUser.role === 'admin' ? 'user' : 'admin';
+    const res = await fetch('/api/me/dev-role', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ role: nextRole }),
+    });
+    if (res.ok) {
+      const data = (await res.json()) as { user: AuthUser };
+      setCurrentUser(data.user);
+    }
+  };
+
+  const handleSignOut = async () => {
+    await fetch('/api/auth/signout', { method: 'POST' });
+    await initSession();
   };
 
   const handleUnlockSpot = async (
@@ -297,11 +335,13 @@ export default function HomePage() {
           userLat,
           userLng,
           mode,
+          mapMode: settings.mapMode,
         }),
       });
       const data = (await res.json()) as {
         error?: string;
         spot?: Spot;
+        visit?: VisitRecord;
         comments?: SpotComment[];
       };
       if (!res.ok || !data.spot) {
@@ -309,38 +349,8 @@ export default function HomePage() {
         return;
       }
 
-      // 訪問ブックの更新（ギブアップ済みの場所に後日現地到着した場合は visited へ昇格！）
-      const existing = visitBook[spotId];
-      let nextEntry = existing;
-
-      if (mode === 'arrive') {
-        const earnedSelfBadge =
-          (existing?.selfDiscovered ?? false) || settings.mapMode === 'treasure';
-        nextEntry = {
-          spotId,
-          spotTitle: data.spot.title,
-          prefecture: data.spot.prefecture,
-          status: 'visited',
-          selfDiscovered: earnedSelfBadge,
-          visitedAt: existing?.visitedAt ?? new Date().toISOString(),
-          privateMemo: existing?.privateMemo,
-          privatePhotoDataUrl: existing?.privatePhotoDataUrl,
-        };
-      } else if (mode === 'give_up' && !existing) {
-        nextEntry = {
-          spotId,
-          spotTitle: data.spot.title,
-          prefecture: data.spot.prefecture,
-          status: 'give_up',
-          selfDiscovered: false,
-          visitedAt: new Date().toISOString(),
-        };
-      }
-
-      if (nextEntry && nextEntry !== existing) {
-        const nextBook = { ...visitBook, [spotId]: nextEntry };
-        setVisitBook(nextBook);
-        saveVisitBook(nextBook);
+      if (data.visit) {
+        setVisitBook((prev) => ({ ...prev, [spotId]: data.visit! }));
       }
 
       setUnlockedModalData({
@@ -350,23 +360,6 @@ export default function HomePage() {
     } finally {
       setIsUnlocking(false);
     }
-  };
-
-  const handleSavePrivateAlbum = (
-    spotId: string,
-    memo: string,
-    photoDataUrl?: string,
-  ) => {
-    const existing = visitBook[spotId];
-    if (!existing) return;
-    const updated: LocalVisitEntry = {
-      ...existing,
-      privateMemo: memo,
-      privatePhotoDataUrl: photoDataUrl,
-    };
-    const nextBook = { ...visitBook, [spotId]: updated };
-    setVisitBook(nextBook);
-    saveVisitBook(nextBook);
   };
 
   const handleDemoApproach = async (spotId: string) => {
@@ -392,7 +385,7 @@ export default function HomePage() {
 
   return (
     <div className="min-h-screen flex flex-col">
-      {/* ヘッダー（日向坂46 空色テーマ） */}
+      {/* ヘッダー */}
       <header className="sticky top-0 z-30 bg-white/90 backdrop-blur-md border-b border-sky-100">
         <div className="max-w-6xl mx-auto px-4 py-3 flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-2.5">
@@ -416,55 +409,65 @@ export default function HomePage() {
           </div>
 
           <div className="flex items-center gap-2">
-            {/* デモ位置シミュレーター開閉ボタン */}
-            <button
-              type="button"
-              onClick={() => setShowSimulatorBar((v) => !v)}
-              className={`px-2.5 py-1.5 rounded-xl text-xs font-bold inline-flex items-center gap-1 border cursor-pointer ${
-                showSimulatorBar
-                  ? 'bg-sky-50 text-sky-700 border-sky-200'
-                  : 'bg-white text-slate-600 border-slate-200'
-              }`}
-            >
-              <FlaskConical className="w-3.5 h-3.5" />
-              位置シミュレーター
-            </button>
+            {meta.enableDemoSimulator && (
+              <button
+                type="button"
+                onClick={() => setShowSimulatorBar((v) => !v)}
+                className={`px-2.5 py-1.5 rounded-xl text-xs font-bold inline-flex items-center gap-1 border cursor-pointer ${
+                  showSimulatorBar
+                    ? 'bg-sky-50 text-sky-700 border-sky-200'
+                    : 'bg-white text-slate-600 border-slate-200'
+                }`}
+              >
+                <FlaskConical className="w-3.5 h-3.5" />
+                位置シミュレーター
+              </button>
+            )}
 
-            {/* ロール切替（プロトタイプ検証用：ゲスト / ログイン中 / 管理者） */}
-            <div className="inline-flex rounded-xl bg-slate-100 p-0.5 border border-slate-200 text-[11px] font-bold">
-              {(
-                [
-                  { id: 'guest', label: 'ゲスト', icon: UserRound },
-                  { id: 'user', label: 'ログイン中', icon: UserCheck },
-                  { id: 'admin', label: '管理者', icon: ShieldCheck },
-                ] as const
-              ).map(({ id, label, icon: Icon }) => (
-                <button
-                  key={id}
-                  type="button"
-                  onClick={() => handleChangeRole(id)}
-                  className={`px-2 py-1 rounded-lg inline-flex items-center gap-1 transition cursor-pointer ${
-                    userRole === id
-                      ? 'bg-white text-sky-700 shadow-sm'
-                      : 'text-slate-500 hover:text-slate-800'
-                  }`}
-                >
-                  <Icon className="w-3 h-3" />
-                  {label}
-                </button>
-              ))}
-            </div>
+            {meta.allowDevRoleSwitch && currentUser && (
+              <button
+                type="button"
+                onClick={handleToggleAdminForDev}
+                title="開発環境用：管理者モード切替"
+                className={`px-2.5 py-1.5 rounded-xl text-xs font-bold inline-flex items-center gap-1 border cursor-pointer ${
+                  currentUser.role === 'admin'
+                    ? 'bg-indigo-600 text-white border-indigo-700'
+                    : 'bg-white text-slate-500 border-slate-200 hover:text-slate-800'
+                }`}
+              >
+                <ShieldCheck className="w-3.5 h-3.5" />
+                {currentUser.role === 'admin' ? 'Admin有効' : 'Admin切替'}
+              </button>
+            )}
+
+            {currentUser?.isAnonymous ? (
+              <button
+                type="button"
+                onClick={() => setShowAuthModal(true)}
+                className="px-3 py-1.5 rounded-xl bg-sky-600 hover:bg-sky-700 text-white text-xs font-extrabold inline-flex items-center gap-1.5 shadow-2xs cursor-pointer"
+              >
+                <UserPlus className="w-3.5 h-3.5" />
+                ログイン / 登録
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => setActiveTab('profile')}
+                className="px-3 py-1.5 rounded-xl bg-sky-50 border border-sky-200 text-sky-800 text-xs font-extrabold inline-flex items-center gap-1.5 cursor-pointer"
+              >
+                <UserCheck className="w-3.5 h-3.5" />
+                {currentUser?.name}
+              </button>
+            )}
           </div>
         </div>
 
-        {/* PC・屋内テスト用の位置・コンパスシミュレーターバー */}
-        {showSimulatorBar && (
+        {/* 位置シミュレーターバー */}
+        {showSimulatorBar && meta.enableDemoSimulator && (
           <div className="bg-sky-950 text-sky-50 px-4 py-2.5 text-xs border-t border-sky-900">
             <div className="max-w-6xl mx-auto flex flex-wrap items-center justify-between gap-2.5">
               <div className="flex flex-wrap items-center gap-2">
-                <span className="font-extrabold text-sky-300">
-                  🧪 位置モード:
-                </span>
+                <span className="font-extrabold text-sky-300">🧪 位置モード:</span>
                 <button
                   type="button"
                   onClick={() => setIsDemoMode(false)}
@@ -475,7 +478,7 @@ export default function HomePage() {
                   }`}
                 >
                   <LocateFixed className="w-3.5 h-3.5" />
-                  端末のリアルGPS・磁気センサー
+                  リアルGPS・磁気センサー
                 </button>
 
                 <select
@@ -557,7 +560,7 @@ export default function HomePage() {
         )}
       </header>
 
-      {/* 接近通知バナー（タップでコンパス直行！） */}
+      {/* 接近通知トースト */}
       {proximityToastSpot && (
         <div className="max-w-xl mx-auto w-full px-4 pt-3">
           <div className="rounded-2xl bg-gradient-to-r from-sky-600 to-indigo-600 text-white p-3.5 shadow-lg flex items-center justify-between gap-3">
@@ -594,15 +597,15 @@ export default function HomePage() {
         </div>
       )}
 
-      {/* デスクトップ用ナビゲーションタブ */}
+      {/* デスクトップナビ */}
       <div className="max-w-6xl mx-auto w-full px-4 pt-4 hidden sm:block">
         <nav className="inline-flex rounded-2xl bg-white p-1.5 border border-sky-100 shadow-xs gap-1">
           {(
             [
               { key: 'explore', label: '周辺・コンパス探索', icon: Compass },
               { key: 'map', label: '聖地マップ（レーダー/通常）', icon: MapIcon },
-              { key: 'register', label: '聖地を追加・一括取込', icon: PlusCircle },
-              { key: 'profile', label: 'マイアルバム・難易度設定', icon: Award },
+              { key: 'register', label: '聖地を追加・管理', icon: PlusCircle },
+              { key: 'profile', label: 'マイアルバム・設定', icon: Award },
             ] as const
           ).map(({ key, label, icon: Icon }) => (
             <button
@@ -622,7 +625,7 @@ export default function HomePage() {
         </nav>
       </div>
 
-      {/* メインコンテンツ領域 */}
+      {/* メイン領域 */}
       <main className="flex-1 max-w-6xl mx-auto w-full px-4 py-5">
         {activeTab === 'explore' && (
           <div>
@@ -630,7 +633,7 @@ export default function HomePage() {
               <CompassView
                 spot={activeCompassSpot}
                 deviceHeadingDeg={deviceHeadingDeg}
-                isDemoMode={isDemoMode}
+                isDemoMode={isDemoMode && meta.enableDemoSimulator}
                 isUnlocking={isUnlocking}
                 errorMessage={unlockError}
                 onBack={() => {
@@ -650,7 +653,6 @@ export default function HomePage() {
               />
             ) : (
               <div className="space-y-5">
-                {/* 絞り込みバー */}
                 <div className="bg-white rounded-3xl border border-sky-100 shadow-xs p-4 space-y-3">
                   <div className="grid grid-cols-1 sm:grid-cols-4 gap-2.5">
                     <select
@@ -723,7 +725,6 @@ export default function HomePage() {
                   </div>
                 </div>
 
-                {/* 周辺の聖地カードリスト（スライド14・22・39のモダン進化版） */}
                 {loadingSpots ? (
                   <div className="text-center py-12 text-sm text-slate-500">
                     周辺の聖地データを検索中...
@@ -850,7 +851,6 @@ export default function HomePage() {
 
         {activeTab === 'map' && (
           <div className="space-y-4">
-            {/* 宝探しレーダーモード ⇄ 通常聖地マップモード 融合スイッチャー */}
             <div className="bg-white rounded-3xl border border-sky-100 shadow-xs p-4 flex flex-wrap items-center justify-between gap-3">
               <div>
                 <h2 className="text-base font-black text-slate-900 flex items-center gap-2">
@@ -910,7 +910,6 @@ export default function HomePage() {
               }}
             />
 
-            {/* 都道府県ごとの聖地件数サマリ（遠征計画のヒント） */}
             <div className="bg-white rounded-3xl border border-sky-100 p-4 space-y-2.5">
               <p className="text-xs font-extrabold text-slate-700">
                 🗾 エリア別の収録聖地件数（タップでその都道府県のリストへ絞り込み）
@@ -937,9 +936,10 @@ export default function HomePage() {
 
         {activeTab === 'register' && (
           <RegisterSpotPanel
-            userRole={userRole}
+            currentUser={currentUser}
             initialLat={userLat}
             initialLng={userLng}
+            onRequireAuth={() => setShowAuthModal(true)}
             onSpotCreated={() => {
               fetchMeta();
               fetchSpots();
@@ -949,6 +949,7 @@ export default function HomePage() {
 
         {activeTab === 'profile' && (
           <ProfileSettingsPanel
+            currentUser={currentUser}
             settings={settings}
             visitBook={visitBook}
             totalSpotsCount={meta.totalSpots}
@@ -956,11 +957,13 @@ export default function HomePage() {
             onOpenVisitedSpot={(spotId) =>
               handleUnlockSpot(spotId, 'view_unlocked')
             }
+            onOpenAuthModal={() => setShowAuthModal(true)}
+            onSignOut={handleSignOut}
           />
         )}
       </main>
 
-      {/* モバイル用ボトムナビゲーション */}
+      {/* モバイルボトムナビ */}
       <nav className="sm:hidden fixed bottom-0 inset-x-0 z-30 bg-white/95 backdrop-blur border-t border-sky-100 grid grid-cols-4 py-1.5 px-2">
         {(
           [
@@ -984,16 +987,35 @@ export default function HomePage() {
         ))}
       </nav>
 
-      {/* 聖地解禁・詳細モーダル */}
+      {/* 解禁詳細モーダル */}
       {unlockedModalData && visitBook[unlockedModalData.spot.id] && (
         <SpotDetailModal
           spot={unlockedModalData.spot}
           visitEntry={visitBook[unlockedModalData.spot.id]!}
+          currentUser={currentUser}
           initialComments={unlockedModalData.comments}
-          defaultPublicComment={settings.defaultPublicComment}
-          nickname={settings.nickname}
           onClose={() => setUnlockedModalData(null)}
-          onSavePrivateAlbum={handleSavePrivateAlbum}
+          onVisitUpdated={(updated) =>
+            setVisitBook((prev) => ({ ...prev, [updated.spotId]: updated }))
+          }
+          onSpotDeleted={() => {
+            fetchMeta();
+            fetchSpots();
+          }}
+        />
+      )}
+
+      {/* アカウント連携・ログインモーダル */}
+      {showAuthModal && (
+        <AuthModal
+          currentUser={currentUser}
+          oauthProviders={meta.oauthProviders}
+          onClose={() => setShowAuthModal(false)}
+          onAuthenticated={(user, visits) => {
+            setCurrentUser(user);
+            setSettings(user.settings);
+            setVisitBook(visits);
+          }}
         />
       )}
     </div>

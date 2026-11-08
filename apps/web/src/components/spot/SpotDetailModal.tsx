@@ -1,73 +1,113 @@
 'use client';
 
 import {
+  type AuthUser,
   MEDIA_CATEGORY_META,
   type Spot,
   type SpotComment,
+  type SpotReportReason,
   validateAndParseReferenceUrl,
+  type VisitRecord,
 } from '@seichi/shared';
 import {
   Award,
   Camera,
   CheckCircle2,
   ExternalLink,
+  Flag,
   Lock,
   MessageSquarePlus,
   Share2,
   ShieldAlert,
+  Trash2,
   X,
 } from 'lucide-react';
 import { useState } from 'react';
-import { compressImageToDataUrl, type LocalVisitEntry } from '@/lib/storage';
+import { compressImageToDataUrl } from '@/lib/storage';
 
 export interface SpotDetailModalProps {
   spot: Spot;
-  visitEntry: LocalVisitEntry;
+  visitEntry: VisitRecord;
+  currentUser: AuthUser | null;
   initialComments: SpotComment[];
-  defaultPublicComment: boolean;
-  nickname: string;
   onClose: () => void;
-  onSavePrivateAlbum: (spotId: string, memo: string, photoDataUrl?: string) => void;
+  onVisitUpdated: (updated: VisitRecord) => void;
+  onSpotDeleted?: (spotId: string) => void;
 }
 
 export function SpotDetailModal({
   spot,
   visitEntry,
+  currentUser,
   initialComments,
-  defaultPublicComment,
-  nickname,
   onClose,
-  onSavePrivateAlbum,
+  onVisitUpdated,
+  onSpotDeleted,
 }: SpotDetailModalProps) {
   const [memo, setMemo] = useState(visitEntry.privateMemo ?? '');
-  const [photoUrl, setPhotoUrl] = useState<string | undefined>(
-    visitEntry.privatePhotoDataUrl,
-  );
-  const [albumSavedToast, setAlbumSavedToast] = useState(false);
+  const [photoCacheBust, setPhotoCacheBust] = useState(() => Date.now());
+  const [uploadingPhoto, setUploadingPhoto] = useState(false);
+  const [savingMemo, setSavingMemo] = useState(false);
+  const [albumToast, setAlbumToast] = useState<string | null>(null);
 
   const [comments, setComments] = useState<SpotComment[]>(initialComments);
   const [commentText, setCommentText] = useState('');
-  const [isPublicComment, setIsPublicComment] = useState(defaultPublicComment);
+  const [isPublicComment, setIsPublicComment] = useState(
+    currentUser?.settings.defaultPublicComment ?? true,
+  );
   const [submittingComment, setSubmittingComment] = useState(false);
+
+  // 通報フォーム
+  const [showReportForm, setShowReportForm] = useState(false);
+  const [reportReason, setReportReason] =
+    useState<SpotReportReason>('wrong_location');
+  const [reportDetail, setReportDetail] = useState('');
+  const [reportSent, setReportSent] = useState(false);
 
   const handlePhotoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    setUploadingPhoto(true);
     try {
-      const compressed = await compressImageToDataUrl(file);
-      setPhotoUrl(compressed);
-      onSavePrivateAlbum(spot.id, memo, compressed);
-      setAlbumSavedToast(true);
-      setTimeout(() => setAlbumSavedToast(false), 2500);
+      const compressedDataUrl = await compressImageToDataUrl(file);
+      const res = await fetch(`/api/me/visits/${spot.id}/photo`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dataUrl: compressedDataUrl }),
+      });
+      const data = (await res.json()) as { error?: string; visit?: VisitRecord };
+      if (!res.ok || !data.visit) {
+        alert(data.error ?? '写真の保存に失敗しました');
+        return;
+      }
+      onVisitUpdated(data.visit);
+      setPhotoCacheBust(Date.now());
+      setAlbumToast('✓ 非公開アルバム（R2）に写真を保存しました！');
+      setTimeout(() => setAlbumToast(null), 3000);
     } catch (err) {
       alert(err instanceof Error ? err.message : '画像の処理に失敗しました');
+    } finally {
+      setUploadingPhoto(false);
     }
   };
 
-  const handleSaveMemo = () => {
-    onSavePrivateAlbum(spot.id, memo, photoUrl);
-    setAlbumSavedToast(true);
-    setTimeout(() => setAlbumSavedToast(false), 2500);
+  const handleSaveMemo = async () => {
+    setSavingMemo(true);
+    try {
+      const res = await fetch(`/api/me/visits/${spot.id}/memo`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ privateMemo: memo }),
+      });
+      const data = (await res.json()) as { visit?: VisitRecord };
+      if (res.ok && data.visit) {
+        onVisitUpdated(data.visit);
+        setAlbumToast('✓ アルバムメモを保存しました！');
+        setTimeout(() => setAlbumToast(null), 2500);
+      }
+    } finally {
+      setSavingMemo(false);
+    }
   };
 
   const handlePostComment = async (e: React.FormEvent) => {
@@ -79,16 +119,14 @@ export function SpotDetailModal({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          authorName: nickname,
+          authorName: currentUser?.settings.nickname ?? 'おひさま探索者',
           content: commentText.trim(),
           isPublic: isPublicComment,
         }),
       });
       if (res.ok) {
         const data = (await res.json()) as { comment: SpotComment };
-        if (data.comment.isPublic) {
-          setComments((prev) => [data.comment, ...prev]);
-        }
+        setComments((prev) => [data.comment, ...prev]);
         setCommentText('');
       }
     } finally {
@@ -96,12 +134,44 @@ export function SpotDetailModal({
     }
   };
 
+  const handleSubmitReport = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const res = await fetch(`/api/spots/${spot.id}/reports`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        reason: reportReason,
+        detail: reportDetail,
+      }),
+    });
+    if (res.ok) {
+      setReportSent(true);
+      setReportDetail('');
+    }
+  };
+
+  const handleAdminDelete = async () => {
+    if (!confirm(`管理者操作：「${spot.title}」を削除しますか？`)) return;
+    const res = await fetch(`/api/admin/spots/${spot.id}`, { method: 'DELETE' });
+    if (res.ok) {
+      onSpotDeleted?.(spot.id);
+      onClose();
+    }
+  };
+
+  const origin =
+    typeof window !== 'undefined' ? window.location.origin : 'https://seichi-compass.pages.dev';
+  const shareUrl = `${origin}/spots/${spot.id}`;
   const shareText =
     visitEntry.status === 'visited'
-      ? `聖地コンパスで日向坂46の聖地「${spot.title}」（${spot.prefecture}）を発見しました！🧭☀️ #日向坂46 #聖地コンパス`
-      : `日向坂46の聖地「${spot.title}」（${spot.prefecture}）をチェックしました！☀️ #日向坂46 #聖地コンパス`;
+      ? `聖地コンパスで日向坂46の聖地（${spot.prefecture}）を${
+          visitEntry.selfDiscovered ? 'コンパス自力発見' : '訪問達成'
+        }しました！🧭☀️ #日向坂46 #聖地コンパス`
+      : `日向坂46の聖地（${spot.prefecture}）をチェックしました！☀️ #日向坂46 #聖地コンパス`;
 
-  const xShareHref = `https://x.com/intent/tweet?text=${encodeURIComponent(shareText)}`;
+  const xShareHref = `https://x.com/intent/tweet?text=${encodeURIComponent(
+    shareText,
+  )}&url=${encodeURIComponent(shareUrl)}`;
 
   return (
     <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4">
@@ -135,20 +205,32 @@ export function SpotDetailModal({
             </h2>
           </div>
 
-          <button
-            type="button"
-            onClick={onClose}
-            className="p-2 rounded-full bg-slate-100 hover:bg-slate-200 text-slate-600 cursor-pointer"
-          >
-            <X className="w-5 h-5" />
-          </button>
+          <div className="flex items-center gap-1.5">
+            {currentUser?.role === 'admin' && (
+              <button
+                type="button"
+                onClick={handleAdminDelete}
+                title="管理者削除"
+                className="p-2 rounded-full bg-rose-50 hover:bg-rose-100 text-rose-600 cursor-pointer"
+              >
+                <Trash2 className="w-4 h-4" />
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={onClose}
+              className="p-2 rounded-full bg-slate-100 hover:bg-slate-200 text-slate-600 cursor-pointer"
+            >
+              <X className="w-5 h-5" />
+            </button>
+          </div>
         </div>
 
         <div className="p-6 space-y-7">
-          {/* エピソード一覧（1地点複数シーン対応） */}
+          {/* エピソード一覧 */}
           <section className="space-y-4">
-            <h3 className="text-sm font-extrabold text-slate-800 flex items-center gap-2">
-              <span>🎬 登場エピソード（{spot.episodes.length}件）</span>
+            <h3 className="text-sm font-extrabold text-slate-800">
+              🎬 登場エピソード（{spot.episodes.length}件）
             </h3>
 
             {spot.episodes.map((ep) => {
@@ -191,7 +273,6 @@ export function SpotDetailModal({
                     {ep.description}
                   </p>
 
-                  {/* YouTube 秒数指定埋め込み */}
                   {ep.youtubeVideoId && (
                     <div className="aspect-video w-full rounded-xl overflow-hidden bg-black border border-slate-200">
                       <iframe
@@ -206,7 +287,6 @@ export function SpotDetailModal({
                     </div>
                   )}
 
-                  {/* 参考URL安全リンク表示 */}
                   {refCheck && refCheck.ok && (
                     <div className="pt-1">
                       <a
@@ -232,7 +312,7 @@ export function SpotDetailModal({
             })}
           </section>
 
-          {/* Xシェア & Googleマップ確認ボタン */}
+          {/* ネタバレ防止シェアURL付き Xポスト & Googleマップ */}
           <div className="flex flex-wrap gap-3">
             <a
               href={xShareHref}
@@ -241,7 +321,7 @@ export function SpotDetailModal({
               className="flex-1 min-w-[200px] py-2.5 px-4 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold flex items-center justify-center gap-2"
             >
               <Share2 className="w-4 h-4" />
-              𝕏（Twitter）で巡礼報告をポスト
+              𝕏（Twitter）で巡礼報告（虫食いカード付）
             </a>
             <a
               href={`https://www.google.com/maps/search/?api=1&query=${spot.lat},${spot.lng}`}
@@ -250,41 +330,46 @@ export function SpotDetailModal({
               className="py-2.5 px-4 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold flex items-center justify-center gap-1.5"
             >
               <ExternalLink className="w-4 h-4" />
-              Googleマップで開く
+              Googleマップ
             </a>
           </div>
 
-          {/* 自分専用の巡礼アルバム（完全非公開） */}
+          {/* 自分専用の巡礼アルバム（R2 非公開保存） */}
           <section className="rounded-2xl border border-sky-200 bg-sky-50/50 p-4 space-y-3">
             <div className="flex items-center justify-between">
               <h3 className="text-sm font-extrabold text-sky-950 flex items-center gap-1.5">
                 <Camera className="w-4 h-4 text-sky-600" />
-                自分専用の巡礼アルバム（非公開）
+                自分専用の巡礼アルバム（非公開ストレージ）
               </h3>
               <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-sky-700 bg-white px-2 py-0.5 rounded-full border border-sky-200">
                 <Lock className="w-3 h-3" />
-                あなただけに表示されます
+                本人のみ閲覧可能
               </span>
             </div>
 
-            {photoUrl && (
+            {visitEntry.hasPrivatePhoto && (
               <div className="relative rounded-xl overflow-hidden border border-sky-200 bg-white max-h-60 flex justify-center">
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img
-                  src={photoUrl}
+                  src={`/api/me/visits/${spot.id}/photo?v=${photoCacheBust}`}
                   alt="自分の巡礼写真"
                   className="object-contain max-h-60"
                 />
               </div>
             )}
 
-            <div className="flex flex-col sm:flex-row gap-2">
+            <div className="flex items-center gap-2">
               <label className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2 rounded-xl bg-white border border-sky-300 text-sky-800 text-xs font-bold hover:bg-sky-100 cursor-pointer">
                 <Camera className="w-4 h-4" />
-                {photoUrl ? '写真を変更する' : '巡礼写真を追加する'}
+                {uploadingPhoto
+                  ? 'アップロード中...'
+                  : visitEntry.hasPrivatePhoto
+                    ? '写真を変更する'
+                    : '巡礼写真をアップロード'}
                 <input
                   type="file"
                   accept="image/*"
+                  disabled={uploadingPhoto}
                   onChange={handlePhotoUpload}
                   className="hidden"
                 />
@@ -301,24 +386,25 @@ export function SpotDetailModal({
               />
               <div className="flex items-center justify-between">
                 <span className="text-xs text-emerald-700 font-semibold">
-                  {albumSavedToast ? '✓ マイアルバムに保存しました！' : ''}
+                  {albumToast ?? ''}
                 </span>
                 <button
                   type="button"
+                  disabled={savingMemo}
                   onClick={handleSaveMemo}
                   className="px-4 py-1.5 rounded-xl bg-sky-600 hover:bg-sky-700 text-white text-xs font-bold cursor-pointer"
                 >
-                  アルバムメモを保存
+                  {savingMemo ? '保存中...' : 'アルバムメモを保存'}
                 </button>
               </div>
             </div>
           </section>
 
-          {/* 到着者限定ひとことコメント（画像なしテキストのみ・公開/非公開選択可） */}
+          {/* 到着者限定ひとことコメント */}
           <section className="space-y-3 border-t border-slate-100 pt-5">
             <h3 className="text-sm font-extrabold text-slate-800 flex items-center gap-1.5">
               <MessageSquarePlus className="w-4 h-4 text-sky-600" />
-              おひさま巡礼ひとことコメント（解禁者のみ閲覧可）
+              おひさま巡礼ひとことコメント（解禁者のみ閲覧・投稿可）
             </h3>
 
             <form onSubmit={handlePostComment} className="space-y-2">
@@ -326,7 +412,7 @@ export function SpotDetailModal({
                 rows={2}
                 value={commentText}
                 onChange={(e) => setCommentText(e.target.value)}
-                placeholder="現地に行った感想や巡礼のコツをひとこと残せます（ネタバレ配慮のため解禁済みの人にだけ表示されます）"
+                placeholder="現地に行った感想や巡礼のコツをひとこと残せます"
                 className="w-full rounded-xl border border-slate-200 px-3 py-2 text-xs text-slate-800 focus:outline-none focus:ring-2 focus:ring-sky-400"
               />
               <div className="flex items-center justify-between gap-2">
@@ -352,7 +438,7 @@ export function SpotDetailModal({
             <div className="space-y-2 pt-1">
               {comments.length === 0 ? (
                 <p className="text-xs text-slate-400">
-                  まだ公開コメントはありません。最初のひとことを残してみましょう！
+                  まだコメントはありません。最初のひとことを残してみましょう！
                 </p>
               ) : (
                 comments.map((c) => (
@@ -361,7 +447,14 @@ export function SpotDetailModal({
                     className="rounded-xl bg-slate-50 border border-slate-100 px-3.5 py-2.5 text-xs space-y-1"
                   >
                     <div className="flex items-center justify-between text-slate-500">
-                      <span className="font-bold text-slate-700">{c.authorName}</span>
+                      <span className="font-bold text-slate-700">
+                        {c.authorName}
+                        {!c.isPublic && (
+                          <span className="ml-1.5 text-[10px] px-1.5 py-0.5 rounded bg-slate-200 text-slate-600">
+                            自分のみ
+                          </span>
+                        )}
+                      </span>
                       <span>{new Date(c.createdAt).toLocaleDateString('ja-JP')}</span>
                     </div>
                     <p className="text-slate-800 whitespace-pre-wrap">{c.content}</p>
@@ -369,6 +462,67 @@ export function SpotDetailModal({
                 ))
               )}
             </div>
+          </section>
+
+          {/* 誤情報・不審URLの通報 */}
+          <section className="border-t border-slate-100 pt-3">
+            {!showReportForm ? (
+              <button
+                type="button"
+                onClick={() => setShowReportForm(true)}
+                className="inline-flex items-center gap-1 text-[11px] text-slate-400 hover:text-rose-600 cursor-pointer"
+              >
+                <Flag className="w-3 h-3" />
+                場所のズレ・重複・不審な参考URLを通報する
+              </button>
+            ) : reportSent ? (
+              <p className="text-xs text-emerald-700 font-semibold">
+                ✓ 通報を受け付けました。管理者が確認いたします。
+              </p>
+            ) : (
+              <form
+                onSubmit={handleSubmitReport}
+                className="rounded-2xl bg-slate-50 border border-slate-200 p-3.5 space-y-2.5 text-xs"
+              >
+                <p className="font-bold text-slate-700">このスポットを通報する</p>
+                <select
+                  value={reportReason}
+                  onChange={(e) =>
+                    setReportReason(e.target.value as SpotReportReason)
+                  }
+                  className="w-full rounded-xl border border-slate-200 bg-white px-3 py-1.5"
+                >
+                  <option value="wrong_location">ピンの位置がズレている</option>
+                  <option value="duplicate">別のスポットと重複している</option>
+                  <option value="unsafe_url">参考URLが不審・リンク切れ</option>
+                  <option value="closed_or_changed">閉店・移転している</option>
+                  <option value="inappropriate">不適切な内容が含まれる</option>
+                  <option value="other">その他</option>
+                </select>
+                <input
+                  type="text"
+                  value={reportDetail}
+                  onChange={(e) => setReportDetail(e.target.value)}
+                  placeholder="補足コメント（任意）"
+                  className="w-full rounded-xl border border-slate-200 bg-white px-3 py-1.5"
+                />
+                <div className="flex justify-end gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setShowReportForm(false)}
+                    className="px-3 py-1 rounded-lg text-slate-500 cursor-pointer"
+                  >
+                    キャンセル
+                  </button>
+                  <button
+                    type="submit"
+                    className="px-3.5 py-1 rounded-lg bg-rose-600 text-white font-bold cursor-pointer"
+                  >
+                    通報を送信
+                  </button>
+                </div>
+              </form>
+            )}
           </section>
         </div>
       </div>

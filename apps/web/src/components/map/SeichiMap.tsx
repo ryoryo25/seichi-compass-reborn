@@ -1,6 +1,10 @@
 'use client';
 
-import type { MapMode, MaskedSpotSummary } from '@seichi/shared';
+import {
+  type MapMode,
+  type MaskedSpotSummary,
+  RADAR_CIRCLE_RADIUS_METERS,
+} from '@seichi/shared';
 import maplibregl from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
 import { useEffect, useRef } from 'react';
@@ -64,6 +68,13 @@ export function SeichiMap({
   const markersRef = useRef<maplibregl.Marker[]>([]);
   const userMarkerRef = useRef<maplibregl.Marker | null>(null);
   const pickerMarkerRef = useRef<maplibregl.Marker | null>(null);
+  const spotsByIdRef = useRef<Map<string, MaskedSpotSummary>>(new Map());
+  const onSelectSpotRef = useRef(onSelectSpot);
+
+  useEffect(() => {
+    spotsByIdRef.current = new Map(spots.map((s) => [s.id, s]));
+    onSelectSpotRef.current = onSelectSpot;
+  }, [spots, onSelectSpot]);
 
   useEffect(() => {
     if (!containerRef.current || mapRef.current) return;
@@ -162,7 +173,13 @@ export function SeichiMap({
           properties: { id: s.id, title: s.displayTitle },
           geometry: {
             type: 'Polygon',
-            coordinates: [createCirclePolygon(s.radarLat, s.radarLng, 420)],
+            coordinates: [
+              createCirclePolygon(
+                s.radarLat,
+                s.radarLng,
+                RADAR_CIRCLE_RADIUS_METERS,
+              ),
+            ],
           },
         })),
       };
@@ -197,6 +214,21 @@ export function SeichiMap({
             'line-dasharray': [3, 2],
             'line-opacity': 0.55,
           },
+        });
+
+        map.on('click', 'radar-circles-fill', (e) => {
+          const spotId = e.features?.[0]?.properties?.id as string | undefined;
+          if (!spotId) return;
+          const clickedSpot = spotsByIdRef.current.get(spotId);
+          if (clickedSpot) {
+            onSelectSpotRef.current?.(clickedSpot);
+          }
+        });
+        map.on('mouseenter', 'radar-circles-fill', () => {
+          map.getCanvas().style.cursor = 'pointer';
+        });
+        map.on('mouseleave', 'radar-circles-fill', () => {
+          map.getCanvas().style.cursor = '';
         });
       }
     };

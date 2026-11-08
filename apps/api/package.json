@@ -11,6 +11,7 @@
   "scripts": {
     "dev": "wrangler dev --port 8787",
     "deploy": "wrangler deploy",
+    "test": "node --experimental-strip-types --test src/__tests__/api.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

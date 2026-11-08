@@ -140,12 +140,58 @@ export const MaskedSpotSummarySchema = z.object({
   visibleMediaCategories: z.array(MediaCategorySchema),
   visibleMembers: z.array(z.string()),
   visibleHashtags: z.array(z.string()),
+  matchesNotificationMembers: z.boolean().default(false),
   radarLat: z.number(),
   radarLng: z.number(),
   exactLat: z.number().optional(),
   exactLng: z.number().optional(),
 });
 export type MaskedSpotSummary = z.infer<typeof MaskedSpotSummarySchema>;
+
+export const PlaceSearchCandidateSchema = z.object({
+  name: z.string(),
+  address: z.string().optional(),
+  lat: z.number(),
+  lng: z.number(),
+  provider: z.enum(['google_places', 'gsi_japan']),
+});
+export type PlaceSearchCandidate = z.infer<typeof PlaceSearchCandidateSchema>;
+
+export const ResolvedLocationResponseSchema = z.object({
+  lat: z.number().optional(),
+  lng: z.number().optional(),
+  placeQuery: z.string().optional(),
+  sourceType: z.string(),
+});
+export type ResolvedLocationResponse = z.infer<typeof ResolvedLocationResponseSchema>;
+
+export const ApiMetaResponseSchema = z.object({
+  totalSpots: z.number(),
+  totalEpisodes: z.number(),
+  prefectures: z.array(
+    z.object({
+      prefecture: z.string(),
+      totalSpots: z.number(),
+    }),
+  ),
+  members: z.array(
+    z.object({
+      id: z.string(),
+      name: z.string(),
+      generation: z.string(),
+      graduated: z.boolean().optional(),
+    }),
+  ),
+  storageMode: z.enum(['neon_postgis', 'local_persistence']),
+  oauthProviders: z.object({
+    twitter: z.boolean(),
+    google: z.boolean(),
+    apple: z.boolean(),
+  }),
+  allowDevRoleSwitch: z.boolean(),
+  enableDemoSimulator: z.boolean(),
+});
+export type ApiMetaResponse = z.infer<typeof ApiMetaResponseSchema>;
 
 export const CreateSpotInputSchema = z.object({
   existingSpotId: z.string().optional(),

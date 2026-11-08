@@ -49,6 +49,7 @@ export function createBetterAuth(env: BetterAuthEnv) {
   return betterAuth({
     secret: env.BETTER_AUTH_SECRET,
     baseURL: env.BETTER_AUTH_URL,
+    basePath: '/api/auth/oauth',
     database: drizzleAdapter(db, {
       provider: 'pg',
       usePlural: true,

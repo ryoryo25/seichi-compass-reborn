@@ -29,12 +29,20 @@ import type {
   StoredPhotoObject,
 } from './repository.ts';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const SEED_PATH = path.resolve(__dirname, '../seed/hinatazaka-spots.json');
-const RUNTIME_DIR = path.resolve(__dirname, '../../../.local-data');
-const RUNTIME_SPOTS_PATH = path.join(RUNTIME_DIR, 'spots-runtime.json');
-const RUNTIME_STATE_PATH = path.join(RUNTIME_DIR, 'app-state-v2.json');
-const LOCAL_R2_DIR = path.join(RUNTIME_DIR, 'r2-album');
+function getLocalPaths() {
+  const baseDir =
+    typeof import.meta?.url === 'string' && import.meta.url.startsWith('file:')
+      ? path.dirname(fileURLToPath(import.meta.url))
+      : process.cwd();
+  const runtimeDir = path.resolve(baseDir, '../../../.local-data');
+  return {
+    seedPath: path.resolve(baseDir, '../seed/hinatazaka-spots.json'),
+    runtimeDir,
+    runtimeSpotsPath: path.join(runtimeDir, 'spots-runtime.json'),
+    runtimeStatePath: path.join(runtimeDir, 'app-state-v2.json'),
+    localR2Dir: path.join(runtimeDir, 'r2-album'),
+  };
+}
 
 interface LocalStoredVisit extends VisitRecord {
   privatePhotoR2Key?: string;
@@ -56,7 +64,7 @@ interface LocalAppState {
 const INITIAL_COMMENTS: SpotComment[] = [
   {
     id: 'cmt_seed_1',
-    spotId: 'spot_demo_catstreet',
+    spotId: 'spot_gme98q_0',
     authorName: 'おひさま1号',
     content:
       'MVのサビと同じアングルで撮れました！朝早めの時間帯だと人が少なくておすすめです☀️',
@@ -74,23 +82,25 @@ export class LocalFsAlbumStorage implements PrivateAlbumStorage {
     bytes: Uint8Array,
     contentType: string,
   ): Promise<void> {
+    const { localR2Dir } = getLocalPaths();
     const safeName = encodeURIComponent(key);
-    fs.mkdirSync(LOCAL_R2_DIR, { recursive: true });
-    fs.writeFileSync(path.join(LOCAL_R2_DIR, safeName), bytes);
+    fs.mkdirSync(localR2Dir, { recursive: true });
+    fs.writeFileSync(path.join(localR2Dir, safeName), bytes);
     fs.writeFileSync(
-      path.join(LOCAL_R2_DIR, `${safeName}.meta.json`),
+      path.join(localR2Dir, `${safeName}.meta.json`),
       JSON.stringify({ contentType }),
       'utf8',
     );
   }
 
   public async getPhoto(key: string): Promise<StoredPhotoObject | null> {
+    const { localR2Dir } = getLocalPaths();
     const safeName = encodeURIComponent(key);
-    const filePath = path.join(LOCAL_R2_DIR, safeName);
+    const filePath = path.join(localR2Dir, safeName);
     if (!fs.existsSync(filePath)) return null;
     const bytes = new Uint8Array(fs.readFileSync(filePath));
     let contentType = 'image/jpeg';
-    const metaPath = path.join(LOCAL_R2_DIR, `${safeName}.meta.json`);
+    const metaPath = path.join(localR2Dir, `${safeName}.meta.json`);
     if (fs.existsSync(metaPath)) {
       try {
         contentType =
@@ -104,9 +114,12 @@ export class LocalFsAlbumStorage implements PrivateAlbumStorage {
   }
 
   public async deletePhoto(key: string): Promise<void> {
+    const { localR2Dir } = getLocalPaths();
     const safeName = encodeURIComponent(key);
-    const filePath = path.join(LOCAL_R2_DIR, safeName);
+    const filePath = path.join(localR2Dir, safeName);
     if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    const metaPath = path.join(localR2Dir, `${safeName}.meta.json`);
+    if (fs.existsSync(metaPath)) fs.unlinkSync(metaPath);
   }
 }
 
@@ -162,20 +175,21 @@ export class LocalPersistenceRepository implements SeichiRepository {
   private state: LocalAppState | null = null;
 
   private ensureLoaded(): void {
+    const { seedPath, runtimeSpotsPath, runtimeStatePath } = getLocalPaths();
     if (this.spots === null) {
-      if (fs.existsSync(RUNTIME_SPOTS_PATH)) {
-        this.spots = JSON.parse(fs.readFileSync(RUNTIME_SPOTS_PATH, 'utf8')) as Spot[];
-      } else if (fs.existsSync(SEED_PATH)) {
-        this.spots = JSON.parse(fs.readFileSync(SEED_PATH, 'utf8')) as Spot[];
+      if (fs.existsSync(runtimeSpotsPath)) {
+        this.spots = JSON.parse(fs.readFileSync(runtimeSpotsPath, 'utf8')) as Spot[];
+      } else if (fs.existsSync(seedPath)) {
+        this.spots = JSON.parse(fs.readFileSync(seedPath, 'utf8')) as Spot[];
       } else {
         this.spots = [];
       }
     }
 
     if (this.state === null) {
-      if (fs.existsSync(RUNTIME_STATE_PATH)) {
+      if (fs.existsSync(runtimeStatePath)) {
         this.state = JSON.parse(
-          fs.readFileSync(RUNTIME_STATE_PATH, 'utf8'),
+          fs.readFileSync(runtimeStatePath, 'utf8'),
         ) as LocalAppState;
       } else {
         this.state = {
@@ -191,14 +205,16 @@ export class LocalPersistenceRepository implements SeichiRepository {
 
   private persistSpots(): void {
     if (!this.spots) return;
-    fs.mkdirSync(RUNTIME_DIR, { recursive: true });
-    fs.writeFileSync(RUNTIME_SPOTS_PATH, JSON.stringify(this.spots), 'utf8');
+    const { runtimeDir, runtimeSpotsPath } = getLocalPaths();
+    fs.mkdirSync(runtimeDir, { recursive: true });
+    fs.writeFileSync(runtimeSpotsPath, JSON.stringify(this.spots), 'utf8');
   }
 
   private persistState(): void {
     if (!this.state) return;
-    fs.mkdirSync(RUNTIME_DIR, { recursive: true });
-    fs.writeFileSync(RUNTIME_STATE_PATH, JSON.stringify(this.state, null, 2), 'utf8');
+    const { runtimeDir, runtimeStatePath } = getLocalPaths();
+    fs.mkdirSync(runtimeDir, { recursive: true });
+    fs.writeFileSync(runtimeStatePath, JSON.stringify(this.state, null, 2), 'utf8');
   }
 
   private sanitizeUser(u: LocalStoredUser): AuthUser {
@@ -254,20 +270,30 @@ export class LocalPersistenceRepository implements SeichiRepository {
   public async mergeAnonymousUserData(
     fromGuestUserId: string,
     toUserId: string,
-  ): Promise<void> {
+  ): Promise<{ r2KeysToDelete: string[] }> {
     this.ensureLoaded();
-    if (fromGuestUserId === toUserId) return;
+    if (fromGuestUserId === toUserId) return { r2KeysToDelete: [] };
     const guestVisits = this.state!.visitsByUser[fromGuestUserId] ?? {};
     const targetVisits = (this.state!.visitsByUser[toUserId] ??= {});
+    const r2KeysToDelete: string[] = [];
 
     for (const [spotId, gv] of Object.entries(guestVisits)) {
       const ex = targetVisits[spotId];
       if (!ex) {
         targetVisits[spotId] = { ...gv, userId: toUserId };
-      } else if (gv.status === 'visited' && ex.status !== 'visited') {
+      } else {
+        if (
+          ex.privatePhotoR2Key &&
+          gv.privatePhotoR2Key &&
+          ex.privatePhotoR2Key !== gv.privatePhotoR2Key
+        ) {
+          r2KeysToDelete.push(gv.privatePhotoR2Key);
+        }
+        const nextStatus =
+          gv.status === 'visited' || ex.status === 'visited' ? 'visited' : 'give_up';
         targetVisits[spotId] = {
           ...ex,
-          status: 'visited',
+          status: nextStatus,
           selfDiscovered: ex.selfDiscovered || gv.selfDiscovered,
           privateMemo: ex.privateMemo ?? gv.privateMemo,
           privatePhotoR2Key: ex.privatePhotoR2Key ?? gv.privatePhotoR2Key,
@@ -277,11 +303,15 @@ export class LocalPersistenceRepository implements SeichiRepository {
       }
     }
     delete this.state!.visitsByUser[fromGuestUserId];
+    if (this.state!.users[fromGuestUserId]?.isAnonymous) {
+      delete this.state!.users[fromGuestUserId];
+    }
 
     for (const c of this.state!.comments) {
       if (c.userId === fromGuestUserId) c.userId = toUserId;
     }
     this.persistState();
+    return { r2KeysToDelete };
   }
 
   public async signUpOrLinkEmail(params: {
@@ -381,6 +411,21 @@ export class LocalPersistenceRepository implements SeichiRepository {
     this.persistState();
   }
 
+  public async issueSessionForUser(
+    userId: string,
+  ): Promise<{ user: AuthUser; sessionToken: string } | null> {
+    this.ensureLoaded();
+    const target = this.state!.users[userId];
+    if (!target) return null;
+    const token = `tok_${crypto.randomUUID()}${crypto.randomUUID().replace(/-/g, '')}`;
+    this.state!.sessions[token] = {
+      userId: target.id,
+      expiresAt: Date.now() + 1000 * 60 * 60 * 24 * 90,
+    };
+    this.persistState();
+    return { user: this.sanitizeUser(target), sessionToken: token };
+  }
+
   public async updateUserSettings(
     userId: string,
     settings: ExplorerSettings,
@@ -463,6 +508,7 @@ export class LocalPersistenceRepository implements SeichiRepository {
     lat: number;
     lng: number;
     member?: string;
+    members?: string[];
     mediaCategory?: MediaCategory;
     prefecture?: string;
     tagQuery?: string;
@@ -470,11 +516,21 @@ export class LocalPersistenceRepository implements SeichiRepository {
   }): Promise<Array<{ spot: Spot; distanceMeters: number }>> {
     this.ensureLoaded();
     const q = params.tagQuery?.trim().toLowerCase();
+    const memberFilterList = params.members?.length
+      ? params.members
+      : params.member
+        ? [params.member]
+        : [];
     const filtered: Array<{ spot: Spot; distanceMeters: number }> = [];
 
     for (const spot of this.spots!) {
       if (params.prefecture && spot.prefecture !== params.prefecture) continue;
-      if (params.member && !spot.episodes.some((ep) => ep.members.includes(params.member!))) {
+      if (
+        memberFilterList.length > 0 &&
+        !spot.episodes.some((ep) =>
+          ep.members.some((m) => memberFilterList.includes(m)),
+        )
+      ) {
         continue;
       }
       if (
@@ -617,13 +673,30 @@ export class LocalPersistenceRepository implements SeichiRepository {
     return target;
   }
 
-  public async deleteSpot(spotId: string): Promise<boolean> {
+  public async deleteSpot(
+    spotId: string,
+  ): Promise<{ deleted: boolean; r2KeysToDelete: string[] }> {
     this.ensureLoaded();
     const before = this.spots!.length;
     this.spots = this.spots!.filter((s) => s.id !== spotId);
-    if (this.spots.length === before) return false;
+    if (this.spots.length === before) {
+      return { deleted: false, r2KeysToDelete: [] };
+    }
+
+    const r2KeysToDelete: string[] = [];
+    for (const userVisits of Object.values(this.state!.visitsByUser)) {
+      const visit = userVisits[spotId];
+      if (visit?.privatePhotoR2Key) {
+        r2KeysToDelete.push(visit.privatePhotoR2Key);
+      }
+      delete userVisits[spotId];
+    }
+    this.state!.comments = this.state!.comments.filter((c) => c.spotId !== spotId);
+    this.state!.reports = this.state!.reports.filter((r) => r.spotId !== spotId);
+
     this.persistSpots();
-    return true;
+    this.persistState();
+    return { deleted: true, r2KeysToDelete };
   }
 
   public async bulkImportCandidates(
@@ -836,8 +909,8 @@ export class LocalPersistenceRepository implements SeichiRepository {
   }
 }
 
-const singletonLocalRepo = new LocalPersistenceRepository();
-const singletonLocalAlbum = new LocalFsAlbumStorage();
+let singletonLocalRepo: LocalPersistenceRepository | null = null;
+let singletonLocalAlbum: LocalFsAlbumStorage | null = null;
 
 /**
  * DATABASE_URL が設定されていれば本番 Neon PostGIS リポジトリ、未設定ならローカル永続リポジトリを返す
@@ -846,6 +919,7 @@ export function resolveRepository(databaseUrl?: string): SeichiRepository {
   if (databaseUrl && databaseUrl.trim().startsWith('postgres')) {
     return new NeonPostgisRepository(databaseUrl.trim());
   }
+  singletonLocalRepo ??= new LocalPersistenceRepository();
   return singletonLocalRepo;
 }
 
@@ -853,5 +927,6 @@ export function resolveAlbumStorage(r2Bucket?: R2LikeBucket): PrivateAlbumStorag
   if (r2Bucket) {
     return new CloudflareR2AlbumStorage(r2Bucket);
   }
+  singletonLocalAlbum ??= new LocalFsAlbumStorage();
   return singletonLocalAlbum;
 }

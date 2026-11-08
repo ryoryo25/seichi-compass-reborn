@@ -2,6 +2,7 @@ import {
   HINATAZAKA_MEMBERS,
   MEDIA_CATEGORY_META,
   type MediaCategory,
+  type PlaceSearchCandidate,
   validateAndParseReferenceUrl,
 } from '@seichi/shared';
 import { useRouter } from 'expo-router';
@@ -34,7 +35,7 @@ export default function RegisterSpotScreen() {
   const [locationInput, setLocationInput] = useState('');
   const [resolving, setResolving] = useState(false);
   const [placeCandidates, setPlaceCandidates] = useState<
-    Array<{ title: string; address: string; lat: number; lng: number }>
+    PlaceSearchCandidate[]
   >([]);
 
   const [pinLat, setPinLat] = useState(coords.lat);
@@ -79,21 +80,22 @@ export default function RegisterSpotScreen() {
       setResolving(true);
       try {
         const res = await mobileApi.resolveLocation(trimmed);
-        if (res.resolved && res.lat !== undefined && res.lng !== undefined) {
+        if (res.lat !== undefined && res.lng !== undefined) {
           setPinLat(res.lat);
           setPinLng(res.lng);
-          if (res.suggestedTitle && !title) {
-            setTitle(res.suggestedTitle);
+          if (res.placeQuery && !title) {
+            setTitle(res.placeQuery);
           }
           setPlaceCandidates([]);
           await checkNearbyDuplicates(res.lat, res.lng);
         } else {
-          const searchRes = await mobileApi.searchPlaces(trimmed);
+          const queryForSearch = res.placeQuery || trimmed;
+          const searchRes = await mobileApi.searchPlaces(queryForSearch);
           setPlaceCandidates(searchRes.candidates);
           if (searchRes.candidates.length === 0) {
             Alert.alert(
               '場所が見つかりません',
-              res.message ?? '別のキーワードまたはGoogleマップ共有URLをお試しください',
+              '別のキーワードまたはGoogleマップ共有URLをお試しください',
             );
           }
         }
@@ -239,13 +241,15 @@ export default function RegisterSpotScreen() {
             onPress={() => {
               setPinLat(cand.lat);
               setPinLng(cand.lng);
-              setTitle(cand.title);
+              setTitle(cand.name);
               setPlaceCandidates([]);
               void checkNearbyDuplicates(cand.lat, cand.lng);
             }}
           >
-            <Text style={styles.candidateTitle}>📍 {cand.title}</Text>
-            <Text style={styles.candidateAddr}>{cand.address}</Text>
+            <Text style={styles.candidateTitle}>📍 {cand.name}</Text>
+            {cand.address ? (
+              <Text style={styles.candidateAddr}>{cand.address}</Text>
+            ) : null}
           </Pressable>
         ))}
       </View>

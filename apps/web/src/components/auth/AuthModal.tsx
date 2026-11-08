@@ -196,7 +196,7 @@ export function AuthModal({
               <div className="grid grid-cols-1 gap-2">
                 {oauthProviders.twitter && (
                   <a
-                    href="/api/auth/oauth/sign-in/twitter"
+                    href="/api/auth/oauth-start/twitter"
                     className="py-2.5 rounded-xl bg-slate-900 text-white text-xs font-bold text-center"
                   >
                     𝕏（Twitter）でログイン
@@ -204,7 +204,7 @@ export function AuthModal({
                 )}
                 {oauthProviders.google && (
                   <a
-                    href="/api/auth/oauth/sign-in/google"
+                    href="/api/auth/oauth-start/google"
                     className="py-2.5 rounded-xl border border-slate-200 text-slate-700 text-xs font-bold text-center hover:bg-slate-50"
                   >
                     Google でログイン
@@ -212,7 +212,7 @@ export function AuthModal({
                 )}
                 {oauthProviders.apple && (
                   <a
-                    href="/api/auth/oauth/sign-in/apple"
+                    href="/api/auth/oauth-start/apple"
                     className="py-2.5 rounded-xl bg-black text-white text-xs font-bold text-center"
                   >
                     Apple でサインイン

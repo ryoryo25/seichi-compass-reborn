@@ -70,7 +70,7 @@ export const HINATAZAKA_MEMBERS: readonly MemberInfo[] = [
 
 const VARIANT_NAME_MAP: Record<string, string> = {
   高橋未来虹: '髙橋未来虹',
-  齊藤京子: '齊藤京子',
+  斎藤京子: '齊藤京子',
   斉藤京子: '齊藤京子',
   渡邊美穂: '渡邉美穂',
 };

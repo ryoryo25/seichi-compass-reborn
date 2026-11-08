@@ -27,7 +27,7 @@ import { compressImageToDataUrl } from '@/lib/storage';
 
 export interface SpotDetailModalProps {
   spot: Spot;
-  visitEntry: VisitRecord;
+  visitEntry?: VisitRecord;
   currentUser: AuthUser | null;
   initialComments: SpotComment[];
   onClose: () => void;
@@ -44,7 +44,7 @@ export function SpotDetailModal({
   onVisitUpdated,
   onSpotDeleted,
 }: SpotDetailModalProps) {
-  const [memo, setMemo] = useState(visitEntry.privateMemo ?? '');
+  const [memo, setMemo] = useState(visitEntry?.privateMemo ?? '');
   const [photoCacheBust, setPhotoCacheBust] = useState(() => Date.now());
   const [uploadingPhoto, setUploadingPhoto] = useState(false);
   const [savingMemo, setSavingMemo] = useState(false);
@@ -163,7 +163,7 @@ export function SpotDetailModal({
     typeof window !== 'undefined' ? window.location.origin : 'https://seichi-compass.pages.dev';
   const shareUrl = `${origin}/spots/${spot.id}`;
   const shareText =
-    visitEntry.status === 'visited'
+    visitEntry?.status === 'visited'
       ? `聖地コンパスで日向坂46の聖地（${spot.prefecture}）を${
           visitEntry.selfDiscovered ? 'コンパス自力発見' : '訪問達成'
         }しました！🧭☀️ #日向坂46 #聖地コンパス`
@@ -180,17 +180,21 @@ export function SpotDetailModal({
         <div className="sticky top-0 z-10 bg-white/95 backdrop-blur border-b border-slate-100 px-6 py-4 flex items-start justify-between gap-3">
           <div>
             <div className="flex flex-wrap items-center gap-2 mb-1">
-              {visitEntry.status === 'visited' ? (
+              {visitEntry?.status === 'visited' ? (
                 <span className="inline-flex items-center gap-1 text-xs font-extrabold px-2.5 py-0.5 rounded-full bg-sky-600 text-white">
                   <CheckCircle2 className="w-3.5 h-3.5" />
                   訪問達成！
                 </span>
-              ) : (
+              ) : visitEntry?.status === 'give_up' ? (
                 <span className="inline-flex items-center gap-1 text-xs font-bold px-2.5 py-0.5 rounded-full bg-slate-200 text-slate-700">
                   ギブアップ閲覧（未達成）
                 </span>
+              ) : (
+                <span className="inline-flex items-center gap-1 text-xs font-bold px-2.5 py-0.5 rounded-full bg-indigo-100 text-indigo-800">
+                  管理者プレビュー（未訪問）
+                </span>
               )}
-              {visitEntry.selfDiscovered && (
+              {visitEntry?.selfDiscovered && (
                 <span className="inline-flex items-center gap-1 text-xs font-extrabold px-2.5 py-0.5 rounded-full bg-amber-100 text-amber-800 border border-amber-300">
                   <Award className="w-3.5 h-3.5" />
                   コンパス自力発見バッジ
@@ -335,70 +339,72 @@ export function SpotDetailModal({
           </div>
 
           {/* 自分専用の巡礼アルバム（R2 非公開保存） */}
-          <section className="rounded-2xl border border-sky-200 bg-sky-50/50 p-4 space-y-3">
-            <div className="flex items-center justify-between">
-              <h3 className="text-sm font-extrabold text-sky-950 flex items-center gap-1.5">
-                <Camera className="w-4 h-4 text-sky-600" />
-                自分専用の巡礼アルバム（非公開ストレージ）
-              </h3>
-              <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-sky-700 bg-white px-2 py-0.5 rounded-full border border-sky-200">
-                <Lock className="w-3 h-3" />
-                本人のみ閲覧可能
-              </span>
-            </div>
-
-            {visitEntry.hasPrivatePhoto && (
-              <div className="relative rounded-xl overflow-hidden border border-sky-200 bg-white max-h-60 flex justify-center">
-                {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img
-                  src={`/api/me/visits/${spot.id}/photo?v=${photoCacheBust}`}
-                  alt="自分の巡礼写真"
-                  className="object-contain max-h-60"
-                />
-              </div>
-            )}
-
-            <div className="flex items-center gap-2">
-              <label className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2 rounded-xl bg-white border border-sky-300 text-sky-800 text-xs font-bold hover:bg-sky-100 cursor-pointer">
-                <Camera className="w-4 h-4" />
-                {uploadingPhoto
-                  ? 'アップロード中...'
-                  : visitEntry.hasPrivatePhoto
-                    ? '写真を変更する'
-                    : '巡礼写真をアップロード'}
-                <input
-                  type="file"
-                  accept="image/*"
-                  disabled={uploadingPhoto}
-                  onChange={handlePhotoUpload}
-                  className="hidden"
-                />
-              </label>
-            </div>
-
-            <div className="space-y-2">
-              <textarea
-                rows={2}
-                value={memo}
-                onChange={(e) => setMemo(e.target.value)}
-                placeholder="自分用の巡礼メモ（例：同じアングルで撮影できた！かき氷も美味しかった）"
-                className="w-full rounded-xl border border-sky-200 bg-white px-3 py-2 text-xs text-slate-800 focus:outline-none focus:ring-2 focus:ring-sky-400"
-              />
+          {visitEntry && (
+            <section className="rounded-2xl border border-sky-200 bg-sky-50/50 p-4 space-y-3">
               <div className="flex items-center justify-between">
-                <span className="text-xs text-emerald-700 font-semibold">
-                  {albumToast ?? ''}
+                <h3 className="text-sm font-extrabold text-sky-950 flex items-center gap-1.5">
+                  <Camera className="w-4 h-4 text-sky-600" />
+                  自分専用の巡礼アルバム（非公開ストレージ）
+                </h3>
+                <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-sky-700 bg-white px-2 py-0.5 rounded-full border border-sky-200">
+                  <Lock className="w-3 h-3" />
+                  本人のみ閲覧可能
                 </span>
-                <button
-                  type="button"
-                  disabled={savingMemo}
-                  onClick={handleSaveMemo}
-                  className="px-4 py-1.5 rounded-xl bg-sky-600 hover:bg-sky-700 text-white text-xs font-bold cursor-pointer"
-                >
-                  {savingMemo ? '保存中...' : 'アルバムメモを保存'}
-                </button>
               </div>
-            </div>
-          </section>
+
+              {visitEntry.hasPrivatePhoto && (
+                <div className="relative rounded-xl overflow-hidden border border-sky-200 bg-white max-h-60 flex justify-center">
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img
+                    src={`/api/me/visits/${spot.id}/photo?v=${photoCacheBust}`}
+                    alt="自分の巡礼写真"
+                    className="object-contain max-h-60"
+                  />
+                </div>
+              )}
+
+              <div className="flex items-center gap-2">
+                <label className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2 rounded-xl bg-white border border-sky-300 text-sky-800 text-xs font-bold hover:bg-sky-100 cursor-pointer">
+                  <Camera className="w-4 h-4" />
+                  {uploadingPhoto
+                    ? 'アップロード中...'
+                    : visitEntry.hasPrivatePhoto
+                      ? '写真を変更する'
+                      : '巡礼写真をアップロード'}
+                  <input
+                    type="file"
+                    accept="image/*"
+                    disabled={uploadingPhoto}
+                    onChange={handlePhotoUpload}
+                    className="hidden"
+                  />
+                </label>
+              </div>
+
+              <div className="space-y-2">
+                <textarea
+                  rows={2}
+                  value={memo}
+                  onChange={(e) => setMemo(e.target.value)}
+                  placeholder="自分用の巡礼メモ（例：同じアングルで撮影できた！かき氷も美味しかった）"
+                  className="w-full rounded-xl border border-sky-200 bg-white px-3 py-2 text-xs text-slate-800 focus:outline-none focus:ring-2 focus:ring-sky-400"
+                />
+                <div className="flex items-center justify-between">
+                  <span className="text-xs text-emerald-700 font-semibold">
+                    {albumToast ?? ''}
+                  </span>
+                  <button
+                    type="button"
+                    disabled={savingMemo}
+                    onClick={handleSaveMemo}
+                    className="px-4 py-1.5 rounded-xl bg-sky-600 hover:bg-sky-700 text-white text-xs font-bold cursor-pointer"
+                  >
+                    {savingMemo ? '保存中...' : 'アルバムメモを保存'}
+                  </button>
+                </div>
+              </div>
+            </section>
+          )}
 
           {/* 到着者限定ひとことコメント */}
           <section className="space-y-3 border-t border-slate-100 pt-5">

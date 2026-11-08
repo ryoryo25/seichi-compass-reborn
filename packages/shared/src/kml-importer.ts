@@ -219,7 +219,11 @@ export function mergeCandidatesIntoSpots(
         title: item.title,
         lat: Number(item.lat.toFixed(6)),
         lng: Number(item.lng.toFixed(6)),
-        prefecture: estimatePrefecture(item.lat, item.lng),
+        prefecture: estimatePrefecture(
+          item.lat,
+          item.lng,
+          `${item.title} ${item.description}`,
+        ),
         arrivalRadiusMeters: estimateArrivalRadius(item.title),
         episodes: [episode],
         createdAt: nowIso,
@@ -229,6 +233,17 @@ export function mergeCandidatesIntoSpots(
   }
 
   return { spots, addedSpots, mergedEpisodes };
+}
+
+function sanitizeHashtag(raw: string): string | null {
+  const cleaned = raw.replace(/^#+/, '').trim();
+  if (!cleaned) return null;
+  if (cleaned.length > 32) return null;
+  if (/https?:\/\//i.test(cleaned) || /mymaps\.usercontent/i.test(cleaned)) {
+    return null;
+  }
+  if (/[<>\r\n\t]/.test(cleaned)) return null;
+  return cleaned;
 }
 
 /**
@@ -287,12 +302,17 @@ export function parseKmlToCandidates(kmlXml: string): RawCandidateEpisode[] {
 
       const members = extractMembersFromText(`${title} ${description}`);
       const hashtags = new Set<string>(defaultHashtags);
-      if (workTitleTag) hashtags.add(workTitleTag.replace(/^#/, ''));
+      if (workTitleTag) {
+        for (const token of workTitleTag.split(/[\s　|、,]+/)) {
+          const cleanTag = sanitizeHashtag(token);
+          if (cleanTag) hashtags.add(cleanTag);
+        }
+      }
 
       // 代表的な楽曲・番組キーワードのハッシュタグ補完
       const songMatches = description.match(/「([^」]{2,20})」/g) ?? [];
       for (const sm of songMatches.slice(0, 2)) {
-        const inner = sm.slice(1, -1).trim();
+        const inner = sanitizeHashtag(sm.slice(1, -1));
         if (inner && !inner.includes(' ')) {
           hashtags.add(inner);
         }
@@ -423,8 +443,8 @@ export function parseCsvToCandidates(csvText: string): RawCandidateEpisode[] {
       tagCol >= 0 && cols[tagCol]
         ? cols[tagCol]!
             .split(/[|、,\s]+/)
-            .map((s) => s.replace(/^#/, '').trim())
-            .filter(Boolean)
+            .map((s) => sanitizeHashtag(s))
+            .filter((s): s is string => Boolean(s))
         : [];
 
     results.push({

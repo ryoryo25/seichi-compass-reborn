@@ -12,7 +12,7 @@
     "dev:api": "npm run dev --workspace=@seichi/api",
     "dev:mobile": "npm run dev --workspace=@seichi/mobile",
     "build": "npm run build --workspace=@seichi/web",
-    "test": "npm run test --workspace=@seichi/shared",
+    "test": "npm run test --workspaces --if-present",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "db:push": "npm run db:push --workspace=@seichi/db",
     "db:seed": "node --experimental-strip-types scripts/seed-neon.ts",

@@ -1,4 +1,4 @@
-import { formatDistance } from '@seichi/shared';
+import { formatDistance, RADAR_CIRCLE_RADIUS_METERS } from '@seichi/shared';
 import { useRouter } from 'expo-router';
 import { Fragment } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
@@ -106,23 +106,29 @@ export default function RadarMapScreen() {
                   latitude: spot.radarLat,
                   longitude: spot.radarLng,
                 }}
-                radius={420}
+                radius={RADAR_CIRCLE_RADIUS_METERS}
                 fillColor="rgba(14, 165, 233, 0.16)"
                 strokeColor="rgba(2, 132, 199, 0.55)"
                 strokeWidth={1.5}
               />
+              {/* レーダー円の中心は最大340mオフセットされたダミー位置のため、正確なピンと誤認させない半透明エリアラベルを使用 */}
               <Marker
                 coordinate={{
                   latitude: spot.radarLat,
                   longitude: spot.radarLng,
                 }}
-                pinColor="#38bdf8"
-                title={`🧭 ${spot.displayTitle}`}
-                description={`レーダー圏内（残り${formatDistance(spot.distanceMeters)}）・タップしてコンパス起動`}
-                onCalloutPress={() =>
+                anchor={{ x: 0.5, y: 0.5 }}
+                tracksViewChanges={false}
+                onPress={() =>
                   router.push(`/compass/${encodeURIComponent(spot.id)}`)
                 }
-              />
+              >
+                <View style={styles.radarAreaBadge}>
+                  <Text style={styles.radarAreaBadgeText} numberOfLines={1}>
+                    🧭 {spot.displayTitle}
+                  </Text>
+                </View>
+              </Marker>
             </Fragment>
           );
         })}
@@ -161,5 +167,19 @@ const styles = StyleSheet.create({
     fontSize: 11,
     color: '#64748b',
     textAlign: 'center',
+  },
+  radarAreaBadge: {
+    backgroundColor: 'rgba(2, 132, 199, 0.86)',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: '#ffffff',
+    maxWidth: 150,
+  },
+  radarAreaBadgeText: {
+    color: '#ffffff',
+    fontSize: 10,
+    fontWeight: '800',
   },
 });

@@ -70,10 +70,18 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [selectedMember, setSelectedMember] = useState('');
   const [selectedMedia, setSelectedMedia] = useState<MediaCategory | ''>('');
   const [tagQuery, setTagQuery] = useState('');
+  const [debouncedTagQuery, setDebouncedTagQuery] = useState('');
   const [pendingSharedUrl, setPendingSharedUrl] = useState<string | null>(null);
   const [geofenceStatusText, setGeofenceStatusText] = useState('未起動');
 
   const initializedRef = useRef(false);
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedTagQuery(tagQuery.trim());
+    }, 250);
+    return () => clearTimeout(timer);
+  }, [tagQuery]);
 
   const reloadSession = useCallback(async () => {
     const session = await mobileApi.initOrRestoreSession();
@@ -111,8 +119,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         lat: coords.lat,
         lng: coords.lng,
         member: selectedMember || undefined,
+        notificationMembers:
+          settings.notificationMembers.length > 0
+            ? settings.notificationMembers
+            : undefined,
         mediaCategory: selectedMedia || undefined,
-        tagQuery: tagQuery.trim() || undefined,
+        tagQuery: debouncedTagQuery || undefined,
         limit: 250,
         maskLevel: settings.maskLevel,
         tagVisibility: settings.tagVisibility,
@@ -129,10 +141,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     coords.lng,
     selectedMember,
     selectedMedia,
-    tagQuery,
+    debouncedTagQuery,
     settings.maskLevel,
     settings.tagVisibility,
     settings.mapMode,
+    settings.notificationMembers,
   ]);
 
   // 初回起動ブートストラップ

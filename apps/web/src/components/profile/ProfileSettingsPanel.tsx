@@ -23,6 +23,8 @@ import {
   UserPlus,
 } from 'lucide-react';
 
+import { useEffect, useState } from 'react';
+
 export interface ProfileSettingsPanelProps {
   currentUser: AuthUser | null;
   settings: ExplorerSettings;
@@ -44,6 +46,22 @@ export function ProfileSettingsPanel({
   onOpenAuthModal,
   onSignOut,
 }: ProfileSettingsPanelProps) {
+  const [nicknameDraft, setNicknameDraft] = useState(settings.nickname);
+
+  useEffect(() => {
+    setNicknameDraft(settings.nickname);
+  }, [settings.nickname]);
+
+  const commitNickname = () => {
+    const trimmed = nicknameDraft.trim();
+    if (!trimmed) {
+      setNicknameDraft(settings.nickname);
+      return;
+    }
+    if (trimmed !== settings.nickname) {
+      onUpdateSettings({ ...settings, nickname: trimmed });
+    }
+  };
   const entries = Object.values(visitBook).sort((a, b) =>
     b.visitedAt.localeCompare(a.visitedAt),
   );
@@ -311,14 +329,32 @@ export function ProfileSettingsPanel({
             <label className="block text-xs font-extrabold text-slate-700">
               表示ニックネーム
             </label>
-            <input
-              type="text"
-              value={settings.nickname}
-              onChange={(e) =>
-                onUpdateSettings({ ...settings, nickname: e.target.value })
-              }
-              className="w-full rounded-xl border border-slate-200 px-3 py-2 text-xs"
-            />
+            <div className="flex gap-2">
+              <input
+                type="text"
+                maxLength={30}
+                value={nicknameDraft}
+                onChange={(e) => setNicknameDraft(e.target.value)}
+                onBlur={commitNickname}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    commitNickname();
+                  }
+                }}
+                className="flex-1 rounded-xl border border-slate-200 px-3 py-2 text-xs"
+              />
+              {nicknameDraft.trim() !== settings.nickname &&
+                nicknameDraft.trim().length > 0 && (
+                  <button
+                    type="button"
+                    onClick={commitNickname}
+                    className="px-3 py-1.5 rounded-xl bg-sky-600 hover:bg-sky-700 text-white text-xs font-bold cursor-pointer"
+                  >
+                    保存
+                  </button>
+                )}
+            </div>
           </div>
         </div>
       </section>

@@ -18,8 +18,10 @@ export interface CompassViewProps {
   deviceHeadingDeg: number;
   isDemoMode: boolean;
   isUnlocking: boolean;
+  needsCompassPermission?: boolean;
   errorMessage?: string | null;
   onBack: () => void;
+  onRequestCompassPermission?: () => void;
   onDemoApproach: () => void;
   onArriveUnlock: () => void;
   onGiveUpUnlock: () => void;
@@ -30,8 +32,10 @@ export function CompassView({
   deviceHeadingDeg,
   isDemoMode,
   isUnlocking,
+  needsCompassPermission = false,
   errorMessage,
   onBack,
+  onRequestCompassPermission,
   onDemoApproach,
   onArriveUnlock,
   onGiveUpUnlock,
@@ -156,6 +160,19 @@ export function CompassView({
           </svg>
         </div>
       </div>
+
+      {needsCompassPermission && !isDemoMode && (
+        <div className="mb-4 text-center">
+          <button
+            type="button"
+            onClick={onRequestCompassPermission}
+            className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-sky-600 hover:bg-sky-700 text-white text-xs font-extrabold shadow-xs cursor-pointer"
+          >
+            <Compass className="w-4 h-4" />
+            端末の方位センサー（電子コンパス）を有効にする
+          </button>
+        </div>
+      )}
 
       {canArrive ? (
         <div className="mb-4 p-3 rounded-2xl bg-amber-50 border border-amber-200 text-amber-900 text-center text-sm font-bold">

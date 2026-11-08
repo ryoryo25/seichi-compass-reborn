@@ -1,6 +1,7 @@
 import {
   formatDistance,
   MEDIA_CATEGORY_META,
+  type MaskedSpotSummary,
   type Spot,
   type SpotComment,
   type SpotReportReason,
@@ -41,7 +42,12 @@ export default function NativeCompassScreen() {
     refreshSpots,
   } = useApp();
 
-  const summary = spots.find((s) => s.id === spotId);
+  const listSummary = spots.find((s) => s.id === spotId);
+  const [fallbackSummary, setFallbackSummary] =
+    useState<MaskedSpotSummary | null>(null);
+  const summary =
+    listSummary ??
+    (fallbackSummary?.id === spotId ? fallbackSummary : undefined);
   const existingVisit = visits[spotId];
 
   const [deviceHeadingDeg, setDeviceHeadingDeg] = useState(0);
@@ -73,6 +79,41 @@ export default function NativeCompassScreen() {
   const [busy, setBusy] = useState(false);
 
   const hapticTriggeredRef = useRef(false);
+  const loadedUnlockedSpotRef = useRef<string | null>(null);
+
+  // ディープリンクやプッシュ通知で最寄り250件外の聖地が開かれた場合も単体サマリを取得
+  useEffect(() => {
+    if (!spotId || listSummary) return;
+    let cancelled = false;
+    void mobileApi
+      .fetchSpotSummary(spotId, {
+        lat: coords.lat,
+        lng: coords.lng,
+        maskLevel: settings.maskLevel,
+        tagVisibility: settings.tagVisibility,
+        mapMode: settings.mapMode,
+      })
+      .then((res) => {
+        if (!cancelled) {
+          setFallbackSummary(res.spot);
+          setDistanceMeters(res.spot.distanceMeters);
+          setBearingDeg(res.spot.bearingDeg);
+          setArrivalRadiusMeters(res.spot.arrivalRadiusMeters);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    spotId,
+    listSummary,
+    coords.lat,
+    coords.lng,
+    settings.maskLevel,
+    settings.tagVisibility,
+    settings.mapMode,
+  ]);
 
   // 1. 電子磁気コンパス（60fps滑らかな方角追従） + 高精度GPS距離更新
   useEffect(() => {
@@ -140,13 +181,15 @@ export default function NativeCompassScreen() {
     void syncBearing(livePos.lat, livePos.lng);
   }, [livePos.lat, livePos.lng, syncBearing]);
 
-  // 3. 既に解禁済みの場合はスポット詳細と非公開写真を読み込み
+  // 3. 既に解禁済みの場合は初回のみスポット詳細と非公開写真を読み込み（歩行中のGPS更新でメモ入力が上書きされないようガード）
   useEffect(() => {
     if (!existingVisit || !spotId) return;
+    if (loadedUnlockedSpotRef.current === spotId) return;
+    loadedUnlockedSpotRef.current = spotId;
     void mobileApi
       .unlockSpot(spotId, {
-        userLat: livePos.lat,
-        userLng: livePos.lng,
+        userLat: coords.lat,
+        userLng: coords.lng,
         mode: 'view_unlocked',
         mapMode: settings.mapMode,
       })
@@ -158,8 +201,10 @@ export default function NativeCompassScreen() {
         }
         setComments(res.comments);
       })
-      .catch(() => {});
-  }, [existingVisit, spotId, livePos.lat, livePos.lng, settings.mapMode]);
+      .catch(() => {
+        loadedUnlockedSpotRef.current = null;
+      });
+  }, [existingVisit, spotId, coords.lat, coords.lng, settings.mapMode]);
 
   useEffect(() => {
     if (!visitRecord?.hasPrivatePhoto) return;

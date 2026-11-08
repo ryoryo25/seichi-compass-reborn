@@ -1,4 +1,5 @@
 import type {
+  ApiMetaResponse,
   AuthUser,
   CreateSpotInput,
   ExplorerSettings,
@@ -6,6 +7,8 @@ import type {
   MaskLevel,
   MaskedSpotSummary,
   MediaCategory,
+  PlaceSearchCandidate,
+  ResolvedLocationResponse,
   Spot,
   SpotComment,
   SpotReport,
@@ -14,6 +17,12 @@ import type {
   VisitRecord,
 } from '@seichi/shared';
 import * as SecureStore from 'expo-secure-store';
+
+export type {
+  ApiMetaResponse,
+  PlaceSearchCandidate,
+  ResolvedLocationResponse,
+};
 
 const SESSION_TOKEN_KEY = 'seichi_bearer_token_v1';
 
@@ -70,17 +79,6 @@ async function apiRequest<T>(
     throw new Error(data.error ?? `APIエラー (${res.status})`);
   }
   return data;
-}
-
-export interface ApiMetaResponse {
-  totalSpots: number;
-  totalEpisodes: number;
-  prefectureCounts: Record<string, number>;
-  members: Array<{ name: string; generation: string }>;
-  storageMode: 'neon_postgis' | 'local_persistence';
-  oauthProviders: { twitter: boolean; google: boolean; apple: boolean };
-  allowDevRoleSwitch: boolean;
-  enableDemoSimulator: boolean;
 }
 
 export interface SessionResponse {
@@ -144,6 +142,8 @@ export const mobileApi = {
     lat: number;
     lng: number;
     member?: string;
+    members?: string[];
+    notificationMembers?: string[];
     mediaCategory?: MediaCategory;
     prefecture?: string;
     tagQuery?: string;
@@ -156,6 +156,28 @@ export const mobileApi = {
       method: 'POST',
       body: JSON.stringify(params),
     }),
+
+  fetchSpotSummary: (
+    spotId: string,
+    params: {
+      lat: number;
+      lng: number;
+      maskLevel?: MaskLevel;
+      tagVisibility?: TagVisibility;
+      mapMode?: MapMode;
+    },
+  ) => {
+    const qs = new URLSearchParams({
+      lat: String(params.lat),
+      lng: String(params.lng),
+      ...(params.maskLevel ? { maskLevel: params.maskLevel } : {}),
+      ...(params.tagVisibility ? { tagVisibility: params.tagVisibility } : {}),
+      ...(params.mapMode ? { mapMode: params.mapMode } : {}),
+    });
+    return apiRequest<{ spot: MaskedSpotSummary }>(
+      `/spots/${encodeURIComponent(spotId)}/summary?${qs.toString()}`,
+    );
+  },
 
   fetchBearing: (spotId: string, lat: number, lng: number) =>
     apiRequest<{
@@ -244,27 +266,15 @@ export const mobileApi = {
     ),
 
   resolveLocation: (input: string) =>
-    apiRequest<{
-      resolved: boolean;
-      lat?: number;
-      lng?: number;
-      suggestedTitle?: string;
-      source?: string;
-      message?: string;
-    }>('/locations/resolve', {
+    apiRequest<ResolvedLocationResponse>('/locations/resolve', {
       method: 'POST',
       body: JSON.stringify({ input }),
     }),
 
   searchPlaces: (query: string) =>
-    apiRequest<{
-      candidates: Array<{
-        title: string;
-        address: string;
-        lat: number;
-        lng: number;
-      }>;
-    }>(`/locations/search?q=${encodeURIComponent(query)}`),
+    apiRequest<{ candidates: PlaceSearchCandidate[] }>(
+      `/locations/search?q=${encodeURIComponent(query)}`,
+    ),
 
   checkDuplicates: (lat: number, lng: number) =>
     apiRequest<{

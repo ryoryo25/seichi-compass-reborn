@@ -95,6 +95,56 @@ export async function searchPlacesByQuery(
   return [];
 }
 
+const ALLOWED_SHORT_URL_HOSTS = new Set([
+  'maps.app.goo.gl',
+  'goo.gl',
+  'google.com',
+  'www.google.com',
+  'maps.google.com',
+  'google.co.jp',
+  'www.google.co.jp',
+]);
+
+async function expandGoogleMapsShortUrlSafely(initialUrl: string): Promise<string> {
+  let currentUrl = initialUrl;
+  for (let hop = 0; hop < 4; hop++) {
+    let parsed: URL;
+    try {
+      parsed = new URL(currentUrl);
+    } catch {
+      break;
+    }
+    if (
+      parsed.protocol !== 'https:' ||
+      !ALLOWED_SHORT_URL_HOSTS.has(parsed.hostname.toLowerCase())
+    ) {
+      break;
+    }
+
+    const resp = await fetch(currentUrl, {
+      method: 'GET',
+      redirect: 'manual',
+    });
+    const locationHeader = resp.headers.get('location');
+    if (!locationHeader || resp.status < 300 || resp.status >= 400) {
+      break;
+    }
+
+    const nextUrl = new URL(locationHeader, currentUrl);
+    if (
+      nextUrl.protocol !== 'https:' ||
+      !ALLOWED_SHORT_URL_HOSTS.has(nextUrl.hostname.toLowerCase())
+    ) {
+      break;
+    }
+    currentUrl = nextUrl.toString();
+    if (currentUrl.includes('/maps/')) {
+      break;
+    }
+  }
+  return currentUrl;
+}
+
 /**
  * Google Maps 短縮URL展開 ＋ `!3d!4d` 座標解析 ＋ 場所名ジオコーディング補完
  */
@@ -109,19 +159,13 @@ export async function resolveLocationInput(
 }> {
   let targetInput = rawInput.trim();
 
-  // 短縮URL (maps.app.goo.gl / goo.gl/maps) のリダイレクト追跡（許可ホスト限定）
+  // 短縮URL (maps.app.goo.gl / goo.gl/maps) の安全な手動リダイレクト展開（SSRF防止・Locationヘッダのみ参照）
   const shortUrlMatch = targetInput.match(
     /https:\/\/(?:maps\.app\.goo\.gl|goo\.gl\/maps)\/[a-zA-Z0-9_-]+/,
   );
   if (shortUrlMatch) {
     try {
-      const resp = await fetch(shortUrlMatch[0], {
-        method: 'GET',
-        redirect: 'follow',
-      });
-      if (resp.url) {
-        targetInput = resp.url;
-      }
+      targetInput = await expandGoogleMapsShortUrlSafely(shortUrlMatch[0]);
     } catch {
       // ignore network failure
     }

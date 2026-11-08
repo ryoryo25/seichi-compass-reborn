@@ -5,6 +5,7 @@ import {
   type ExplorerSettings,
   ExplorerSettingsSchema,
   formatDistance,
+  haversineDistanceMeters,
   HINATAZAKA_MEMBERS,
   MEDIA_CATEGORY_META,
   type MaskedSpotSummary,
@@ -90,14 +91,26 @@ export default function HomePage() {
   const [filterCategory, setFilterCategory] = useState<MediaCategory | ''>('');
   const [filterPrefecture, setFilterPrefecture] = useState('');
   const [tagQuery, setTagQuery] = useState('');
+  const [debouncedTagQuery, setDebouncedTagQuery] = useState('');
   const [onlyUnvisited, setOnlyUnvisited] = useState(false);
 
-  // 周辺スポット & 選択中コンパス
+  // 周辺スポット & 選択中コンパス（遠方スポット直接指定時のフォールバック含む）
   const [spots, setSpots] = useState<MaskedSpotSummary[]>([]);
   const [loadingSpots, setLoadingSpots] = useState(true);
   const [selectedCompassSpotId, setSelectedCompassSpotId] = useState<string | null>(
     null,
   );
+  const [fallbackCompassSpot, setFallbackCompassSpot] =
+    useState<MaskedSpotSummary | null>(null);
+  const [needsCompassPermission, setNeedsCompassPermission] = useState(false);
+  const lastGpsPosRef = useRef<{ lat: number; lng: number } | null>(null);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setDebouncedTagQuery(tagQuery.trim());
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [tagQuery]);
 
   // 解禁モーダル
   const [unlockedModalData, setUnlockedModalData] = useState<{
@@ -165,39 +178,94 @@ export default function HomePage() {
     fetchMeta();
   }, [fetchMeta]);
 
-  // 3. リアルGPS & 磁気コンパス購読
+  const applyOrientationEvent = useCallback((event: DeviceOrientationEvent) => {
+    const webkitHeading = (
+      event as DeviceOrientationEvent & { webkitCompassHeading?: number }
+    ).webkitCompassHeading;
+    if (typeof webkitHeading === 'number') {
+      setDeviceHeadingDeg(webkitHeading);
+    } else if (typeof event.alpha === 'number') {
+      setDeviceHeadingDeg((360 - event.alpha) % 360);
+    }
+  }, []);
+
+  const handleRequestCompassPermission = useCallback(async () => {
+    if (typeof DeviceOrientationEvent === 'undefined') return;
+    const reqPerm = (
+      DeviceOrientationEvent as unknown as {
+        requestPermission?: () => Promise<'granted' | 'denied'>;
+      }
+    ).requestPermission;
+    if (typeof reqPerm !== 'function') {
+      setNeedsCompassPermission(false);
+      return;
+    }
+    try {
+      const state = await reqPerm();
+      if (state === 'granted') {
+        setNeedsCompassPermission(false);
+      }
+    } catch {
+      // ignore user dismissal
+    }
+  }, []);
+
+  // 3. リアルGPS（15m移動閾値デバウンス） & 磁気コンパス購読（iOS 13+ 権限プロンプト対応）
   useEffect(() => {
     if (isDemoMode || typeof window === 'undefined') return;
+
+    if (typeof DeviceOrientationEvent !== 'undefined') {
+      const reqPerm = (
+        DeviceOrientationEvent as unknown as {
+          requestPermission?: () => Promise<string>;
+        }
+      ).requestPermission;
+      if (typeof reqPerm === 'function') {
+        setNeedsCompassPermission(true);
+      }
+    }
 
     let watchId: number | null = null;
     if ('geolocation' in navigator) {
       watchId = navigator.geolocation.watchPosition(
         (pos) => {
-          setUserLat(Number(pos.coords.latitude.toFixed(6)));
-          setUserLng(Number(pos.coords.longitude.toFixed(6)));
+          const nextLat = Number(pos.coords.latitude.toFixed(6));
+          const nextLng = Number(pos.coords.longitude.toFixed(6));
+          const prev = lastGpsPosRef.current;
+          if (
+            !prev ||
+            haversineDistanceMeters(prev.lat, prev.lng, nextLat, nextLng) >= 15
+          ) {
+            lastGpsPosRef.current = { lat: nextLat, lng: nextLng };
+            setUserLat(nextLat);
+            setUserLng(nextLng);
+          }
         },
         () => {},
         { enableHighAccuracy: true, maximumAge: 5000 },
       );
     }
 
-    const handleOrientation = (event: DeviceOrientationEvent) => {
-      const webkitHeading = (
-        event as DeviceOrientationEvent & { webkitCompassHeading?: number }
-      ).webkitCompassHeading;
-      if (typeof webkitHeading === 'number') {
-        setDeviceHeadingDeg(webkitHeading);
-      } else if (typeof event.alpha === 'number') {
-        setDeviceHeadingDeg((360 - event.alpha) % 360);
-      }
-    };
-
-    window.addEventListener('deviceorientation', handleOrientation, true);
+    window.addEventListener(
+      'deviceorientationabsolute',
+      applyOrientationEvent as EventListener,
+      true,
+    );
+    window.addEventListener('deviceorientation', applyOrientationEvent, true);
     return () => {
       if (watchId !== null) navigator.geolocation.clearWatch(watchId);
-      window.removeEventListener('deviceorientation', handleOrientation, true);
+      window.removeEventListener(
+        'deviceorientationabsolute',
+        applyOrientationEvent as EventListener,
+        true,
+      );
+      window.removeEventListener(
+        'deviceorientation',
+        applyOrientationEvent,
+        true,
+      );
     };
-  }, [isDemoMode]);
+  }, [isDemoMode, applyOrientationEvent]);
 
   // 4. 周辺スポット検索（サーバー上の訪問状態と自動統合）
   const fetchSpots = useCallback(async () => {
@@ -211,9 +279,13 @@ export default function HomePage() {
           lat: userLat,
           lng: userLng,
           member: filterMember || undefined,
+          notificationMembers:
+            settings.notificationMembers.length > 0
+              ? settings.notificationMembers
+              : undefined,
           mediaCategory: filterCategory || undefined,
           prefecture: filterPrefecture || undefined,
-          tagQuery: tagQuery || undefined,
+          tagQuery: debouncedTagQuery || undefined,
           limit: 300,
           maskLevel: settings.maskLevel,
           tagVisibility: settings.tagVisibility,
@@ -233,16 +305,59 @@ export default function HomePage() {
     filterMember,
     filterCategory,
     filterPrefecture,
-    tagQuery,
+    debouncedTagQuery,
     settings.maskLevel,
     settings.tagVisibility,
     settings.mapMode,
+    settings.notificationMembers,
     visitBook,
   ]);
 
   useEffect(() => {
     fetchSpots();
   }, [fetchSpots]);
+
+  // 4b. ?compass=<spotId> 等で最寄り300件外の遠方スポットが選択された場合の単体サマリ取得
+  useEffect(() => {
+    if (!sessionReady || !selectedCompassSpotId) {
+      setFallbackCompassSpot(null);
+      return;
+    }
+    if (spots.some((s) => s.id === selectedCompassSpotId)) {
+      return;
+    }
+    let cancelled = false;
+    const qs = new URLSearchParams({
+      lat: String(userLat),
+      lng: String(userLng),
+      maskLevel: settings.maskLevel,
+      tagVisibility: settings.tagVisibility,
+      mapMode: settings.mapMode,
+    });
+    fetch(
+      `/api/spots/${encodeURIComponent(selectedCompassSpotId)}/summary?${qs.toString()}`,
+    )
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data: { spot?: MaskedSpotSummary } | null) => {
+        if (!cancelled && data?.spot) {
+          setFallbackCompassSpot(data.spot);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    sessionReady,
+    selectedCompassSpotId,
+    spots,
+    userLat,
+    userLng,
+    settings.maskLevel,
+    settings.tagVisibility,
+    settings.mapMode,
+    visitBook,
+  ]);
 
   // 5. 接近通知検知
   useEffect(() => {
@@ -257,12 +372,7 @@ export default function HomePage() {
       if (s.distanceMeters > settings.notificationRadiusMeters) return false;
       const lastNotified = notifiedSpotTimestamps.current[s.id] ?? 0;
       if (now - lastNotified < cooldownMs) return false;
-      if (settings.notificationMembers.length > 0) {
-        return s.visibleMembers.some((m) =>
-          settings.notificationMembers.includes(m),
-        );
-      }
-      return true;
+      return s.matchesNotificationMembers !== false;
     });
 
     if (candidate) {
@@ -286,8 +396,13 @@ export default function HomePage() {
 
   const activeCompassSpot = useMemo(() => {
     if (!selectedCompassSpotId) return null;
-    return spots.find((s) => s.id === selectedCompassSpotId) ?? null;
-  }, [spots, selectedCompassSpotId]);
+    return (
+      spots.find((s) => s.id === selectedCompassSpotId) ??
+      (fallbackCompassSpot?.id === selectedCompassSpotId
+        ? fallbackCompassSpot
+        : null)
+    );
+  }, [spots, selectedCompassSpotId, fallbackCompassSpot]);
 
   const handleUpdateSettings = async (next: ExplorerSettings) => {
     setSettings(next);
@@ -635,11 +750,15 @@ export default function HomePage() {
                 deviceHeadingDeg={deviceHeadingDeg}
                 isDemoMode={isDemoMode && meta.enableDemoSimulator}
                 isUnlocking={isUnlocking}
+                needsCompassPermission={needsCompassPermission}
                 errorMessage={unlockError}
                 onBack={() => {
                   setSelectedCompassSpotId(null);
                   setUnlockError(null);
                 }}
+                onRequestCompassPermission={() =>
+                  void handleRequestCompassPermission()
+                }
                 onDemoApproach={() => handleDemoApproach(activeCompassSpot.id)}
                 onArriveUnlock={() =>
                   handleUnlockSpot(
@@ -987,11 +1106,11 @@ export default function HomePage() {
         ))}
       </nav>
 
-      {/* 解禁詳細モーダル */}
-      {unlockedModalData && visitBook[unlockedModalData.spot.id] && (
+      {/* 解禁詳細モーダル（未訪問Adminの直接閲覧にも対応） */}
+      {unlockedModalData && (
         <SpotDetailModal
           spot={unlockedModalData.spot}
-          visitEntry={visitBook[unlockedModalData.spot.id]!}
+          visitEntry={visitBook[unlockedModalData.spot.id]}
           currentUser={currentUser}
           initialComments={unlockedModalData.comments}
           onClose={() => setUnlockedModalData(null)}

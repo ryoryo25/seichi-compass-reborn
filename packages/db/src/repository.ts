@@ -47,9 +47,16 @@ export interface SeichiRepository {
     password: string;
   }): Promise<{ user: AuthUser; sessionToken: string }>;
   signOutSession(token: string): Promise<void>;
+  issueSessionForUser(userId: string): Promise<{
+    user: AuthUser;
+    sessionToken: string;
+  } | null>;
   updateUserSettings(userId: string, settings: ExplorerSettings): Promise<AuthUser>;
   setUserRoleForDev(userId: string, role: 'user' | 'admin'): Promise<AuthUser>;
-  mergeAnonymousUserData(fromGuestUserId: string, toUserId: string): Promise<void>;
+  mergeAnonymousUserData(
+    fromGuestUserId: string,
+    toUserId: string,
+  ): Promise<{ r2KeysToDelete: string[] }>;
   getPublicUserAchievements(userId: string): Promise<PublicUserAchievements | null>;
 
   // 聖地スポット検索・取得・登録・編集
@@ -63,6 +70,7 @@ export interface SeichiRepository {
     lat: number;
     lng: number;
     member?: string;
+    members?: string[];
     mediaCategory?: MediaCategory;
     prefecture?: string;
     tagQuery?: string;
@@ -75,7 +83,10 @@ export interface SeichiRepository {
   ): Promise<Array<{ spot: Spot; distanceMeters: number }>>;
   createOrAppendSpot(input: CreateSpotInput, createdByUserId: string): Promise<Spot>;
   updateSpot(spotId: string, input: UpdateSpotInput): Promise<Spot | null>;
-  deleteSpot(spotId: string): Promise<boolean>;
+  deleteSpot(spotId: string): Promise<{
+    deleted: boolean;
+    r2KeysToDelete: string[];
+  }>;
   bulkImportCandidates(
     candidates: RawCandidateEpisode[],
     createdByUserId: string,

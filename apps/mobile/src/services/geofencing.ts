@@ -1,4 +1,8 @@
-import type { ExplorerSettings, MaskedSpotSummary } from '@seichi/shared';
+import {
+  type ExplorerSettings,
+  type MaskedSpotSummary,
+  RADAR_MAX_OFFSET_METERS,
+} from '@seichi/shared';
 import * as Location from 'expo-location';
 import * as Notifications from 'expo-notifications';
 import * as SecureStore from 'expo-secure-store';
@@ -124,7 +128,14 @@ if (!TaskManager.isTaskDefined(GEOFENCE_TASK_NAME)) {
         const { spots } = await mobileApi.searchSpots({
           lat: pos.coords.latitude,
           lng: pos.coords.longitude,
-          member: settings.notificationMembers[0],
+          members:
+            settings.notificationMembers.length > 0
+              ? settings.notificationMembers
+              : undefined,
+          notificationMembers:
+            settings.notificationMembers.length > 0
+              ? settings.notificationMembers
+              : undefined,
           limit: 50,
           maskLevel: settings.maskLevel,
           tagVisibility: settings.tagVisibility,
@@ -199,7 +210,14 @@ if (!TaskManager.isTaskDefined(OUT_AND_ABOUT_TASK_NAME)) {
       const { spots } = await mobileApi.searchSpots({
         lat: latest.coords.latitude,
         lng: latest.coords.longitude,
-        member: settings.notificationMembers[0],
+        members:
+          settings.notificationMembers.length > 0
+            ? settings.notificationMembers
+            : undefined,
+        notificationMembers:
+          settings.notificationMembers.length > 0
+            ? settings.notificationMembers
+            : undefined,
         limit: 12,
         maskLevel: settings.maskLevel,
         tagVisibility: settings.tagVisibility,
@@ -208,7 +226,9 @@ if (!TaskManager.isTaskDefined(OUT_AND_ABOUT_TASK_NAME)) {
 
       const target = spots.find(
         (s) =>
-          !s.isUnlocked && s.distanceMeters <= settings.notificationRadiusMeters,
+          !s.isUnlocked &&
+          s.matchesNotificationMembers !== false &&
+          s.distanceMeters <= settings.notificationRadiusMeters,
       );
       if (!target) return;
 
@@ -238,12 +258,7 @@ async function registerPowerSaveRegions(
   settings: ExplorerSettings,
 ): Promise<void> {
   const unvisited = spots
-    .filter((s) => !s.isUnlocked)
-    .filter(
-      (s) =>
-        settings.notificationMembers.length === 0 ||
-        s.visibleMembers.some((m) => settings.notificationMembers.includes(m)),
-    )
+    .filter((s) => !s.isUnlocked && s.matchesNotificationMembers !== false)
     .slice(0, 18);
 
   const metaCache: Record<string, CachedSpotMeta> = {};
@@ -256,11 +271,11 @@ async function registerPowerSaveRegions(
   }
   await writeJsonToStore(SPOT_META_CACHE_KEY, metaCache);
 
-  // radarLat/radarLngは真の座標から最大480mオフセットされているため、
-  // 480m + 通知半径 のジオフェンスを張ることで正確な座標を端末へ一切漏洩させずに接近検知を保証する
+  // radarLat/radarLngは真の座標から最大 RADAR_MAX_OFFSET_METERS (340m) オフセットされているため、
+  // 340m + 通知半径 のジオフェンスを張ることで正確な座標を端末へ一切漏洩させずに接近検知を保証する
   const safeGeofenceRadius = Math.max(
-    650,
-    480 + settings.notificationRadiusMeters,
+    550,
+    RADAR_MAX_OFFSET_METERS + settings.notificationRadiusMeters,
   );
 
   const regions: Location.LocationRegion[] = unvisited.map((s) => ({

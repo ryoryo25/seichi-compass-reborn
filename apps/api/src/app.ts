@@ -15,18 +15,23 @@ import {
   haversineDistanceMeters,
   HINATAZAKA_MEMBERS,
   MapModeSchema,
+  type MapMode,
   MaskLevelSchema,
+  type MaskLevel,
   maskSpotTitle,
   type MaskedSpotSummary,
   type MediaCategory,
   MediaCategorySchema,
   parseCsvToCandidates,
   parseKmlToCandidates,
+  type Spot,
   SpotReportReasonSchema,
   TagVisibilitySchema,
+  type TagVisibility,
   UpdateSpotInputSchema,
+  type VisitRecord,
 } from '@seichi/shared';
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import { cors } from 'hono/cors';
 import { deleteCookie, getCookie, setCookie } from 'hono/cookie';
 import { z } from 'zod';
@@ -36,6 +41,8 @@ export interface ApiBindings {
   DATABASE_URL?: string;
   BETTER_AUTH_SECRET?: string;
   BETTER_AUTH_URL?: string;
+  NEXT_PUBLIC_APP_URL?: string;
+  ALLOWED_ORIGINS?: string;
   GOOGLE_MAPS_API_KEY?: string;
   TWITTER_CLIENT_ID?: string;
   TWITTER_CLIENT_SECRET?: string;
@@ -49,6 +56,8 @@ export interface ApiBindings {
 }
 
 const SESSION_COOKIE_NAME = 'seichi_session';
+const OAUTH_GUEST_COOKIE_NAME = 'seichi_oauth_guest';
+const BETTER_AUTH_COOKIE_NAME = 'better-auth.session_token';
 
 function getEnvValue<K extends keyof ApiBindings>(
   cEnv: ApiBindings | undefined,
@@ -61,15 +70,91 @@ function getEnvValue<K extends keyof ApiBindings>(
   return undefined;
 }
 
+/**
+ * 開発用機能フラグ判定（フェイルクローズ設計）
+ * - 明示的に "true" が指定された場合、または未設定かつローカル `NODE_ENV === 'development'` の場合のみ有効。
+ * - 本番環境・Cloudflare Workers 等で環境変数が未設定の場合は必ず false になる。
+ */
+function isDevFeatureEnabled(
+  cEnv: ApiBindings | undefined,
+  key: 'ALLOW_DEV_ROLE_SWITCH' | 'ENABLE_DEMO_SIMULATOR',
+): boolean {
+  const raw = getEnvValue(cEnv, key);
+  if (raw === 'true') return true;
+  if (raw === 'false') return false;
+  return (
+    typeof process !== 'undefined' && process.env?.NODE_ENV === 'development'
+  );
+}
+
+function isSecureRequest(c: Context<{ Bindings: ApiBindings }>): boolean {
+  if (c.req.url.startsWith('https://')) return true;
+  if (c.req.header('x-forwarded-proto') === 'https') return true;
+  return false;
+}
+
+function sessionCookieOptions(c: Context<{ Bindings: ApiBindings }>) {
+  return {
+    httpOnly: true,
+    sameSite: 'Lax' as const,
+    secure: isSecureRequest(c),
+    path: '/',
+    maxAge: 60 * 60 * 24 * 90,
+  };
+}
+
+function resolveAllowedCorsOrigin(
+  requestOrigin: string,
+  cEnv: ApiBindings | undefined,
+): string | null {
+  if (!requestOrigin) return null;
+  const allowlist = new Set<string>();
+  const addUrlOrigin = (raw?: string) => {
+    if (!raw) return;
+    for (const part of raw.split(',')) {
+      const trimmed = part.trim();
+      if (!trimmed) continue;
+      try {
+        allowlist.add(new URL(trimmed).origin);
+      } catch {
+        // ignore invalid URL
+      }
+    }
+  };
+
+  addUrlOrigin(getEnvValue(cEnv, 'BETTER_AUTH_URL'));
+  addUrlOrigin(getEnvValue(cEnv, 'NEXT_PUBLIC_APP_URL'));
+  addUrlOrigin(getEnvValue(cEnv, 'ALLOWED_ORIGINS'));
+
+  const isProd =
+    typeof process !== 'undefined' && process.env?.NODE_ENV === 'production';
+  if (!isProd) {
+    allowlist.add('http://localhost:3000');
+    allowlist.add('http://127.0.0.1:3000');
+    allowlist.add('http://localhost:8081');
+    allowlist.add('http://127.0.0.1:8081');
+    allowlist.add('http://localhost:8787');
+  }
+
+  return allowlist.has(requestOrigin) ? requestOrigin : null;
+}
+
 function extractRequestToken(
   authHeader: string | undefined,
   cookieToken: string | undefined,
+  betterAuthCookie?: string | undefined,
 ): string | undefined {
   if (authHeader?.startsWith('Bearer ')) {
     const bearer = authHeader.slice('Bearer '.length).trim();
     if (bearer) return bearer;
   }
-  return cookieToken;
+  if (cookieToken) return cookieToken;
+  if (betterAuthCookie) {
+    // Better Auth signed cookie format: "<sessionToken>.<hmacSignature>"
+    const rawToken = decodeURIComponent(betterAuthCookie).split('.')[0]?.trim();
+    if (rawToken) return rawToken;
+  }
+  return undefined;
 }
 
 function decodeDataUrlToBytes(dataUrl: string): {
@@ -97,6 +182,8 @@ const SearchRequestSchema = z.object({
   lat: z.number().min(-90).max(90),
   lng: z.number().min(-180).max(180),
   member: z.string().optional(),
+  members: z.array(z.string()).optional(),
+  notificationMembers: z.array(z.string()).optional(),
   mediaCategory: MediaCategorySchema.optional(),
   prefecture: z.string().optional(),
   tagQuery: z.string().optional(),
@@ -105,6 +192,80 @@ const SearchRequestSchema = z.object({
   tagVisibility: TagVisibilitySchema.default('all'),
   mapMode: MapModeSchema.default('treasure'),
 });
+
+function buildMaskedSpotSummary(params: {
+  spot: Spot;
+  distanceMeters: number;
+  userLat: number;
+  userLng: number;
+  visitRecord?: VisitRecord;
+  maskLevel: MaskLevel;
+  tagVisibility: TagVisibility;
+  mapMode: MapMode;
+  notificationMembers?: string[];
+}): MaskedSpotSummary {
+  const { spot, distanceMeters, userLat, userLng, visitRecord } = params;
+  const isUnlocked = Boolean(visitRecord);
+  const visitStatus = visitRecord?.status ?? 'unvisited';
+
+  const allMedia = Array.from(
+    new Set(spot.episodes.map((ep) => ep.mediaCategory)),
+  ) as MediaCategory[];
+  const allMembers = Array.from(
+    new Set(spot.episodes.flatMap((ep) => ep.members)),
+  );
+  const allHashtags = Array.from(
+    new Set(spot.episodes.flatMap((ep) => ep.hashtags)),
+  );
+
+  const visibleTags = isUnlocked
+    ? {
+        visibleMediaCategories: allMedia,
+        visibleMembers: allMembers,
+        visibleHashtags: allHashtags,
+      }
+    : filterSpotTagsForVisibility(
+        {
+          mediaCategories: allMedia,
+          members: allMembers,
+          hashtags: allHashtags,
+        },
+        params.tagVisibility,
+      );
+
+  const notifyFilter = params.notificationMembers ?? [];
+  const matchesNotificationMembers =
+    notifyFilter.length === 0 ||
+    allMembers.some((m) => notifyFilter.includes(m));
+
+  const { radarLat, radarLng } = getBlurredRadarPoint(
+    spot.id,
+    spot.lat,
+    spot.lng,
+  );
+  const exposeExactCoords = isUnlocked || params.mapMode === 'standard';
+
+  return {
+    id: spot.id,
+    displayTitle: isUnlocked
+      ? spot.title
+      : maskSpotTitle(spot.id, spot.title, params.maskLevel),
+    isUnlocked,
+    visitStatus,
+    selfDiscovered: visitRecord?.selfDiscovered ?? false,
+    distanceMeters,
+    bearingDeg: calculateBearingDeg(userLat, userLng, spot.lat, spot.lng),
+    arrivalRadiusMeters: spot.arrivalRadiusMeters,
+    prefecture: spot.prefecture,
+    episodeCount: spot.episodes.length,
+    ...visibleTags,
+    matchesNotificationMembers,
+    radarLat,
+    radarLng,
+    exactLat: exposeExactCoords ? spot.lat : undefined,
+    exactLng: exposeExactCoords ? spot.lng : undefined,
+  };
+}
 
 const UnlockRequestSchema = z.object({
   userLat: z.number().min(-90).max(90),
@@ -119,7 +280,7 @@ export function createApiApp() {
   app.use(
     '*',
     cors({
-      origin: (origin) => origin || '*',
+      origin: (origin, c) => resolveAllowedCorsOrigin(origin, c.env),
       credentials: true,
       allowHeaders: ['Content-Type', 'Authorization'],
       allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
@@ -132,15 +293,35 @@ export function createApiApp() {
     resolveAlbumStorage(getEnvValue(env, 'ALBUM_BUCKET'));
 
   const resolveCurrentUser = async (
-    authHeader: string | undefined,
-    cookieVal: string | undefined,
-    env?: ApiBindings,
+    c: Context<{ Bindings: ApiBindings }>,
   ): Promise<{ user: AuthUser; token: string } | null> => {
-    const token = extractRequestToken(authHeader, cookieVal);
+    const token = extractRequestToken(
+      c.req.header('Authorization'),
+      getCookie(c, SESSION_COOKIE_NAME),
+      getCookie(c, BETTER_AUTH_COOKIE_NAME) ??
+        getCookie(c, `__Secure-${BETTER_AUTH_COOKIE_NAME}`),
+    );
     if (!token) return null;
-    const user = await getRepo(env).getUserBySessionToken(token);
+    const user = await getRepo(c.env).getUserBySessionToken(token);
     if (!user) return null;
     return { user, token };
+  };
+
+  const buildBetterAuthFromEnv = (env?: ApiBindings) => {
+    const dbUrl = getEnvValue(env, 'DATABASE_URL');
+    const secret = getEnvValue(env, 'BETTER_AUTH_SECRET');
+    if (!dbUrl || !secret) return null;
+    return createBetterAuth({
+      DATABASE_URL: dbUrl,
+      BETTER_AUTH_SECRET: secret,
+      BETTER_AUTH_URL: getEnvValue(env, 'BETTER_AUTH_URL'),
+      TWITTER_CLIENT_ID: getEnvValue(env, 'TWITTER_CLIENT_ID'),
+      TWITTER_CLIENT_SECRET: getEnvValue(env, 'TWITTER_CLIENT_SECRET'),
+      GOOGLE_CLIENT_ID: getEnvValue(env, 'GOOGLE_CLIENT_ID'),
+      GOOGLE_CLIENT_SECRET: getEnvValue(env, 'GOOGLE_CLIENT_SECRET'),
+      APPLE_CLIENT_ID: getEnvValue(env, 'APPLE_CLIENT_ID'),
+      APPLE_CLIENT_SECRET: getEnvValue(env, 'APPLE_CLIENT_SECRET'),
+    });
   };
 
   return (
@@ -159,10 +340,8 @@ export function createApiApp() {
             google: Boolean(getEnvValue(c.env, 'GOOGLE_CLIENT_ID')),
             apple: Boolean(getEnvValue(c.env, 'APPLE_CLIENT_ID')),
           },
-          allowDevRoleSwitch:
-            getEnvValue(c.env, 'ALLOW_DEV_ROLE_SWITCH') !== 'false',
-          enableDemoSimulator:
-            getEnvValue(c.env, 'ENABLE_DEMO_SIMULATOR') !== 'false',
+          allowDevRoleSwitch: isDevFeatureEnabled(c.env, 'ALLOW_DEV_ROLE_SWITCH'),
+          enableDemoSimulator: isDevFeatureEnabled(c.env, 'ENABLE_DEMO_SIMULATOR'),
         });
       })
 
@@ -172,16 +351,13 @@ export function createApiApp() {
         const currentToken = extractRequestToken(
           c.req.header('Authorization'),
           getCookie(c, SESSION_COOKIE_NAME),
+          getCookie(c, BETTER_AUTH_COOKIE_NAME) ??
+            getCookie(c, `__Secure-${BETTER_AUTH_COOKIE_NAME}`),
         );
         const { user, sessionToken } =
           await repo.getOrCreateAnonymousUser(currentToken);
 
-        setCookie(c, SESSION_COOKIE_NAME, sessionToken, {
-          httpOnly: true,
-          sameSite: 'Lax',
-          path: '/',
-          maxAge: 60 * 60 * 24 * 90,
-        });
+        setCookie(c, SESSION_COOKIE_NAME, sessionToken, sessionCookieOptions(c));
 
         const visits = await repo.getUserVisits(user.id);
         return c.json({ user, sessionToken, visits });
@@ -202,6 +378,8 @@ export function createApiApp() {
           const currentToken = extractRequestToken(
             c.req.header('Authorization'),
             getCookie(c, SESSION_COOKIE_NAME),
+            getCookie(c, BETTER_AUTH_COOKIE_NAME) ??
+              getCookie(c, `__Secure-${BETTER_AUTH_COOKIE_NAME}`),
           );
           const body = c.req.valid('json');
           try {
@@ -209,12 +387,7 @@ export function createApiApp() {
               currentSessionToken: currentToken,
               ...body,
             });
-            setCookie(c, SESSION_COOKIE_NAME, sessionToken, {
-              httpOnly: true,
-              sameSite: 'Lax',
-              path: '/',
-              maxAge: 60 * 60 * 24 * 90,
-            });
+            setCookie(c, SESSION_COOKIE_NAME, sessionToken, sessionCookieOptions(c));
             const visits = await repo.getUserVisits(user.id);
             return c.json({ user, sessionToken, visits });
           } catch (err) {
@@ -240,6 +413,8 @@ export function createApiApp() {
           const currentToken = extractRequestToken(
             c.req.header('Authorization'),
             getCookie(c, SESSION_COOKIE_NAME),
+            getCookie(c, BETTER_AUTH_COOKIE_NAME) ??
+              getCookie(c, `__Secure-${BETTER_AUTH_COOKIE_NAME}`),
           );
           const body = c.req.valid('json');
           try {
@@ -247,12 +422,7 @@ export function createApiApp() {
               currentSessionToken: currentToken,
               ...body,
             });
-            setCookie(c, SESSION_COOKIE_NAME, sessionToken, {
-              httpOnly: true,
-              sameSite: 'Lax',
-              path: '/',
-              maxAge: 60 * 60 * 24 * 90,
-            });
+            setCookie(c, SESSION_COOKIE_NAME, sessionToken, sessionCookieOptions(c));
             const visits = await repo.getUserVisits(user.id);
             return c.json({ user, sessionToken, visits });
           } catch (err) {
@@ -269,43 +439,124 @@ export function createApiApp() {
         const token = extractRequestToken(
           c.req.header('Authorization'),
           getCookie(c, SESSION_COOKIE_NAME),
+          getCookie(c, BETTER_AUTH_COOKIE_NAME) ??
+            getCookie(c, `__Secure-${BETTER_AUTH_COOKIE_NAME}`),
         );
         if (token) await repo.signOutSession(token);
         deleteCookie(c, SESSION_COOKIE_NAME, { path: '/' });
+        deleteCookie(c, BETTER_AUTH_COOKIE_NAME, { path: '/' });
         return c.json({ ok: true });
       })
 
-      // Better Auth OAuth エンドポイント（X / Google / Apple 設定時）
-      .all('/auth/oauth/*', async (c) => {
-        const dbUrl = getEnvValue(c.env, 'DATABASE_URL');
-        const secret = getEnvValue(c.env, 'BETTER_AUTH_SECRET');
-        if (!dbUrl || !secret) {
+      // OAuth ソーシャルログイン開始（現在のゲストトークンを一時保管してから Better Auth 認可URLへリダイレクト）
+      .get('/auth/oauth-start/:provider', async (c) => {
+        const provider = c.req.param('provider');
+        if (provider !== 'twitter' && provider !== 'google' && provider !== 'apple') {
+          return c.json({ error: 'Unsupported OAuth provider' }, 400);
+        }
+        const auth = buildBetterAuthFromEnv(c.env);
+        if (!auth) {
           return c.json(
-            { error: 'OAuthプロバイダを使用するには DATABASE_URL と BETTER_AUTH_SECRET の設定が必要です' },
+            {
+              error:
+                'OAuthプロバイダを使用するには DATABASE_URL と BETTER_AUTH_SECRET の設定が必要です',
+            },
             501,
           );
         }
-        const auth = createBetterAuth({
-          DATABASE_URL: dbUrl,
-          BETTER_AUTH_SECRET: secret,
-          BETTER_AUTH_URL: getEnvValue(c.env, 'BETTER_AUTH_URL'),
-          TWITTER_CLIENT_ID: getEnvValue(c.env, 'TWITTER_CLIENT_ID'),
-          TWITTER_CLIENT_SECRET: getEnvValue(c.env, 'TWITTER_CLIENT_SECRET'),
-          GOOGLE_CLIENT_ID: getEnvValue(c.env, 'GOOGLE_CLIENT_ID'),
-          GOOGLE_CLIENT_SECRET: getEnvValue(c.env, 'GOOGLE_CLIENT_SECRET'),
-          APPLE_CLIENT_ID: getEnvValue(c.env, 'APPLE_CLIENT_ID'),
-          APPLE_CLIENT_SECRET: getEnvValue(c.env, 'APPLE_CLIENT_SECRET'),
+
+        const currentGuestToken = getCookie(c, SESSION_COOKIE_NAME);
+        if (currentGuestToken) {
+          setCookie(c, OAUTH_GUEST_COOKIE_NAME, currentGuestToken, {
+            httpOnly: true,
+            sameSite: 'Lax',
+            secure: isSecureRequest(c),
+            path: '/',
+            maxAge: 60 * 10,
+          });
+        }
+
+        const socialRes = await auth.api.signInSocial({
+          body: {
+            provider,
+            callbackURL: '/api/auth/oauth-bridge',
+          },
+          headers: c.req.raw.headers,
+          asResponse: true,
         });
+
+        // Better Auth の state Cookie 等を維持したまま認可画面へ 302 リダイレクト
+        const bodyData = (await socialRes
+          .clone()
+          .json()
+          .catch(() => null)) as { url?: string } | null;
+        if (bodyData?.url) {
+          const headers = new Headers(socialRes.headers);
+          headers.set('Location', bodyData.url);
+          return new Response(null, { status: 302, headers });
+        }
+        return socialRes;
+      })
+
+      // OAuth コールバック完了ブリッジ（ゲスト記録・R2写真を自動マージして seichi_session を発行）
+      .get('/auth/oauth-bridge', async (c) => {
+        const auth = buildBetterAuthFromEnv(c.env);
+        if (!auth) return c.redirect('/');
+
+        const baSession = await auth.api.getSession({
+          headers: c.req.raw.headers,
+        });
+        if (!baSession?.user?.id) {
+          return c.redirect('/');
+        }
+
+        const repo = getRepo(c.env);
+        const album = getAlbum(c.env);
+        const guestToken = getCookie(c, OAUTH_GUEST_COOKIE_NAME);
+        if (guestToken) {
+          const guestUser = await repo.getUserBySessionToken(guestToken);
+          if (guestUser?.isAnonymous && guestUser.id !== baSession.user.id) {
+            const { r2KeysToDelete } = await repo.mergeAnonymousUserData(
+              guestUser.id,
+              baSession.user.id,
+            );
+            for (const key of r2KeysToDelete) {
+              await album.deletePhoto(key).catch(() => {});
+            }
+          }
+          deleteCookie(c, OAUTH_GUEST_COOKIE_NAME, { path: '/' });
+        }
+
+        const issued = await repo.issueSessionForUser(baSession.user.id);
+        if (issued) {
+          setCookie(
+            c,
+            SESSION_COOKIE_NAME,
+            issued.sessionToken,
+            sessionCookieOptions(c),
+          );
+        }
+        return c.redirect('/');
+      })
+
+      // Better Auth OAuth エンドポイント（コールバック等）
+      .all('/auth/oauth/*', async (c) => {
+        const auth = buildBetterAuthFromEnv(c.env);
+        if (!auth) {
+          return c.json(
+            {
+              error:
+                'OAuthプロバイダを使用するには DATABASE_URL と BETTER_AUTH_SECRET の設定が必要です',
+            },
+            501,
+          );
+        }
         return auth.handler(c.req.raw);
       })
 
       // 3. ユーザー設定・開発ロール切替・公開実績プロフィール
       .put('/me/settings', zValidator('json', ExplorerSettingsSchema), async (c) => {
-        const auth = await resolveCurrentUser(
-          c.req.header('Authorization'),
-          getCookie(c, SESSION_COOKIE_NAME),
-          c.env,
-        );
+        const auth = await resolveCurrentUser(c);
         if (!auth) return c.json({ error: 'Unauthorized' }, 401);
         const updated = await getRepo(c.env).updateUserSettings(
           auth.user.id,
@@ -318,14 +569,10 @@ export function createApiApp() {
         '/me/dev-role',
         zValidator('json', z.object({ role: z.enum(['user', 'admin']) })),
         async (c) => {
-          if (getEnvValue(c.env, 'ALLOW_DEV_ROLE_SWITCH') === 'false') {
+          if (!isDevFeatureEnabled(c.env, 'ALLOW_DEV_ROLE_SWITCH')) {
             return c.json({ error: '本番環境では無効化されています' }, 403);
           }
-          const auth = await resolveCurrentUser(
-            c.req.header('Authorization'),
-            getCookie(c, SESSION_COOKIE_NAME),
-            c.env,
-          );
+          const auth = await resolveCurrentUser(c);
           if (!auth) return c.json({ error: 'Unauthorized' }, 401);
           const updated = await getRepo(c.env).setUserRoleForDev(
             auth.user.id,
@@ -345,14 +592,10 @@ export function createApiApp() {
         return c.json({ achievements: stats });
       })
 
-      // 4. 聖地検索・Xシェア用非ネタバレプレビュー・コンパス方位・到着判定
+      // 4. 聖地検索・単体サマリ取得・Xシェア用非ネタバレプレビュー・コンパス方位・到着判定
       .post('/spots/search', zValidator('json', SearchRequestSchema), async (c) => {
         const repo = getRepo(c.env);
-        const auth = await resolveCurrentUser(
-          c.req.header('Authorization'),
-          getCookie(c, SESSION_COOKIE_NAME),
-          c.env,
-        );
+        const auth = await resolveCurrentUser(c);
         const userVisits = auth ? await repo.getUserVisits(auth.user.id) : {};
         const body = c.req.valid('json');
 
@@ -360,6 +603,7 @@ export function createApiApp() {
           lat: body.lat,
           lng: body.lng,
           member: body.member || undefined,
+          members: body.members?.length ? body.members : undefined,
           mediaCategory: body.mediaCategory,
           prefecture: body.prefecture || undefined,
           tagQuery: body.tagQuery || undefined,
@@ -367,71 +611,68 @@ export function createApiApp() {
         });
 
         const summaries: MaskedSpotSummary[] = results.map(
-          ({ spot, distanceMeters }) => {
-            const visitRecord = userVisits[spot.id];
-            const isUnlocked = Boolean(visitRecord);
-            const visitStatus = visitRecord?.status ?? 'unvisited';
-
-            const allMedia = Array.from(
-              new Set(spot.episodes.map((ep) => ep.mediaCategory)),
-            ) as MediaCategory[];
-            const allMembers = Array.from(
-              new Set(spot.episodes.flatMap((ep) => ep.members)),
-            );
-            const allHashtags = Array.from(
-              new Set(spot.episodes.flatMap((ep) => ep.hashtags)),
-            );
-
-            const visibleTags = isUnlocked
-              ? {
-                  visibleMediaCategories: allMedia,
-                  visibleMembers: allMembers,
-                  visibleHashtags: allHashtags,
-                }
-              : filterSpotTagsForVisibility(
-                  {
-                    mediaCategories: allMedia,
-                    members: allMembers,
-                    hashtags: allHashtags,
-                  },
-                  body.tagVisibility,
-                );
-
-            const { radarLat, radarLng } = getBlurredRadarPoint(
-              spot.id,
-              spot.lat,
-              spot.lng,
-            );
-            const exposeExactCoords = isUnlocked || body.mapMode === 'standard';
-
-            return {
-              id: spot.id,
-              displayTitle: isUnlocked
-                ? spot.title
-                : maskSpotTitle(spot.id, spot.title, body.maskLevel),
-              isUnlocked,
-              visitStatus,
-              selfDiscovered: visitRecord?.selfDiscovered ?? false,
+          ({ spot, distanceMeters }) =>
+            buildMaskedSpotSummary({
+              spot,
               distanceMeters,
-              bearingDeg: calculateBearingDeg(
-                body.lat,
-                body.lng,
-                spot.lat,
-                spot.lng,
-              ),
-              arrivalRadiusMeters: spot.arrivalRadiusMeters,
-              prefecture: spot.prefecture,
-              episodeCount: spot.episodes.length,
-              ...visibleTags,
-              radarLat,
-              radarLng,
-              exactLat: exposeExactCoords ? spot.lat : undefined,
-              exactLng: exposeExactCoords ? spot.lng : undefined,
-            };
-          },
+              userLat: body.lat,
+              userLng: body.lng,
+              visitRecord: userVisits[spot.id],
+              maskLevel: body.maskLevel,
+              tagVisibility: body.tagVisibility,
+              mapMode: body.mapMode,
+              notificationMembers: body.notificationMembers,
+            }),
         );
 
         return c.json({ spots: summaries });
+      })
+
+      .get('/spots/:id/summary', async (c) => {
+        const lat = Number(c.req.query('lat'));
+        const lng = Number(c.req.query('lng'));
+        if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+          return c.json({ error: 'Invalid coordinates' }, 400);
+        }
+
+        const repo = getRepo(c.env);
+        const spot = await repo.getSpotById(c.req.param('id'));
+        if (!spot) return c.json({ error: 'Spot not found' }, 404);
+
+        const auth = await resolveCurrentUser(c);
+        const userVisits = auth ? await repo.getUserVisits(auth.user.id) : {};
+
+        const maskLevelParsed = MaskLevelSchema.safeParse(
+          c.req.query('maskLevel'),
+        );
+        const tagVisibilityParsed = TagVisibilitySchema.safeParse(
+          c.req.query('tagVisibility'),
+        );
+        const mapModeParsed = MapModeSchema.safeParse(c.req.query('mapMode'));
+
+        const distanceMeters = haversineDistanceMeters(
+          lat,
+          lng,
+          spot.lat,
+          spot.lng,
+        );
+
+        return c.json({
+          spot: buildMaskedSpotSummary({
+            spot,
+            distanceMeters,
+            userLat: lat,
+            userLng: lng,
+            visitRecord: userVisits[spot.id],
+            maskLevel: maskLevelParsed.success
+              ? maskLevelParsed.data
+              : 'normal',
+            tagVisibility: tagVisibilityParsed.success
+              ? tagVisibilityParsed.data
+              : 'all',
+            mapMode: mapModeParsed.success ? mapModeParsed.data : 'treasure',
+          }),
+        });
       })
 
       .get('/spots/:id/share-preview', async (c) => {
@@ -476,7 +717,7 @@ export function createApiApp() {
       })
 
       .post('/demo/approach/:id', async (c) => {
-        if (getEnvValue(c.env, 'ENABLE_DEMO_SIMULATOR') === 'false') {
+        if (!isDevFeatureEnabled(c.env, 'ENABLE_DEMO_SIMULATOR')) {
           return c.json({ error: 'Demo simulator is disabled' }, 403);
         }
         const spot = await getRepo(c.env).getSpotById(c.req.param('id'));
@@ -495,15 +736,17 @@ export function createApiApp() {
           const currentToken = extractRequestToken(
             c.req.header('Authorization'),
             getCookie(c, SESSION_COOKIE_NAME),
+            getCookie(c, BETTER_AUTH_COOKIE_NAME) ??
+              getCookie(c, `__Secure-${BETTER_AUTH_COOKIE_NAME}`),
           );
           const { user, sessionToken } =
             await repo.getOrCreateAnonymousUser(currentToken);
-          setCookie(c, SESSION_COOKIE_NAME, sessionToken, {
-            httpOnly: true,
-            sameSite: 'Lax',
-            path: '/',
-            maxAge: 60 * 60 * 24 * 90,
-          });
+          setCookie(
+            c,
+            SESSION_COOKIE_NAME,
+            sessionToken,
+            sessionCookieOptions(c),
+          );
 
           const spotId = c.req.param('id');
           const body = c.req.valid('json');
@@ -571,11 +814,7 @@ export function createApiApp() {
 
       // 5. 自分専用の巡礼アルバム（Cloudflare R2 非公開バケット ＋ オーナー厳格認可）
       .get('/me/visits', async (c) => {
-        const auth = await resolveCurrentUser(
-          c.req.header('Authorization'),
-          getCookie(c, SESSION_COOKIE_NAME),
-          c.env,
-        );
+        const auth = await resolveCurrentUser(c);
         if (!auth) return c.json({ visits: {} });
         const visits = await getRepo(c.env).getUserVisits(auth.user.id);
         return c.json({ visits });
@@ -585,11 +824,7 @@ export function createApiApp() {
         '/me/visits/:spotId/memo',
         zValidator('json', z.object({ privateMemo: z.string().max(1000) })),
         async (c) => {
-          const auth = await resolveCurrentUser(
-            c.req.header('Authorization'),
-            getCookie(c, SESSION_COOKIE_NAME),
-            c.env,
-          );
+          const auth = await resolveCurrentUser(c);
           if (!auth) return c.json({ error: 'Unauthorized' }, 401);
           const updated = await getRepo(c.env).updateVisitAlbum({
             userId: auth.user.id,
@@ -605,11 +840,7 @@ export function createApiApp() {
         '/me/visits/:spotId/photo',
         zValidator('json', z.object({ dataUrl: z.string().min(20) })),
         async (c) => {
-          const auth = await resolveCurrentUser(
-            c.req.header('Authorization'),
-            getCookie(c, SESSION_COOKIE_NAME),
-            c.env,
-          );
+          const auth = await resolveCurrentUser(c);
           if (!auth) return c.json({ error: 'Unauthorized' }, 401);
 
           const spotId = c.req.param('spotId');
@@ -654,11 +885,7 @@ export function createApiApp() {
       )
 
       .get('/me/visits/:spotId/photo', async (c) => {
-        const auth = await resolveCurrentUser(
-          c.req.header('Authorization'),
-          getCookie(c, SESSION_COOKIE_NAME),
-          c.env,
-        );
+        const auth = await resolveCurrentUser(c);
         if (!auth) return c.json({ error: 'Unauthorized' }, 401);
 
         const meta = await getRepo(c.env).getVisitPhotoMeta(
@@ -722,11 +949,7 @@ export function createApiApp() {
       })
 
       .post('/spots', zValidator('json', CreateSpotInputSchema), async (c) => {
-        const auth = await resolveCurrentUser(
-          c.req.header('Authorization'),
-          getCookie(c, SESSION_COOKIE_NAME),
-          c.env,
-        );
+        const auth = await resolveCurrentUser(c);
         if (!auth || auth.user.isAnonymous) {
           return c.json(
             {
@@ -762,11 +985,7 @@ export function createApiApp() {
           }),
         ),
         async (c) => {
-          const auth = await resolveCurrentUser(
-            c.req.header('Authorization'),
-            getCookie(c, SESSION_COOKIE_NAME),
-            c.env,
-          );
+          const auth = await resolveCurrentUser(c);
           if (!auth) return c.json({ error: 'Unauthorized' }, 401);
 
           const spotId = c.req.param('id');
@@ -800,11 +1019,7 @@ export function createApiApp() {
           }),
         ),
         async (c) => {
-          const auth = await resolveCurrentUser(
-            c.req.header('Authorization'),
-            getCookie(c, SESSION_COOKIE_NAME),
-            c.env,
-          );
+          const auth = await resolveCurrentUser(c);
           if (!auth) return c.json({ error: 'Unauthorized' }, 401);
           const body = c.req.valid('json');
           const report = await getRepo(c.env).createReport({
@@ -819,11 +1034,7 @@ export function createApiApp() {
 
       // 8. 管理者機能（一括インポート・マイマップURL同期・通報審査・スポット編集削除）
       .get('/admin/reports', async (c) => {
-        const auth = await resolveCurrentUser(
-          c.req.header('Authorization'),
-          getCookie(c, SESSION_COOKIE_NAME),
-          c.env,
-        );
+        const auth = await resolveCurrentUser(c);
         if (!auth || auth.user.role !== 'admin') {
           return c.json({ error: '管理者権限が必要です' }, 403);
         }
@@ -843,11 +1054,7 @@ export function createApiApp() {
           z.object({ status: z.enum(['resolved', 'dismissed']) }),
         ),
         async (c) => {
-          const auth = await resolveCurrentUser(
-            c.req.header('Authorization'),
-            getCookie(c, SESSION_COOKIE_NAME),
-            c.env,
-          );
+          const auth = await resolveCurrentUser(c);
           if (!auth || auth.user.role !== 'admin') {
             return c.json({ error: '管理者権限が必要です' }, 403);
           }
@@ -864,11 +1071,7 @@ export function createApiApp() {
         '/admin/spots/:id',
         zValidator('json', UpdateSpotInputSchema),
         async (c) => {
-          const auth = await resolveCurrentUser(
-            c.req.header('Authorization'),
-            getCookie(c, SESSION_COOKIE_NAME),
-            c.env,
-          );
+          const auth = await resolveCurrentUser(c);
           if (!auth || auth.user.role !== 'admin') {
             return c.json({ error: '管理者権限が必要です' }, 403);
           }
@@ -882,16 +1085,20 @@ export function createApiApp() {
       )
 
       .delete('/admin/spots/:id', async (c) => {
-        const auth = await resolveCurrentUser(
-          c.req.header('Authorization'),
-          getCookie(c, SESSION_COOKIE_NAME),
-          c.env,
-        );
+        const auth = await resolveCurrentUser(c);
         if (!auth || auth.user.role !== 'admin') {
           return c.json({ error: '管理者権限が必要です' }, 403);
         }
-        const ok = await getRepo(c.env).deleteSpot(c.req.param('id'));
-        return c.json({ deleted: ok });
+        const { deleted, r2KeysToDelete } = await getRepo(c.env).deleteSpot(
+          c.req.param('id'),
+        );
+        if (deleted && r2KeysToDelete.length > 0) {
+          const album = getAlbum(c.env);
+          for (const key of r2KeysToDelete) {
+            await album.deletePhoto(key).catch(() => {});
+          }
+        }
+        return c.json({ deleted });
       })
 
       .post(
@@ -904,11 +1111,7 @@ export function createApiApp() {
           }),
         ),
         async (c) => {
-          const auth = await resolveCurrentUser(
-            c.req.header('Authorization'),
-            getCookie(c, SESSION_COOKIE_NAME),
-            c.env,
-          );
+          const auth = await resolveCurrentUser(c);
           if (!auth || auth.user.role !== 'admin') {
             return c.json({ error: '一括インポートは管理者権限のみ実行可能です' }, 403);
           }

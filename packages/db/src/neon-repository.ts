@@ -67,10 +67,16 @@ export class NeonPostgisRepository implements SeichiRepository {
   ): Promise<Spot[]> {
     if (spotRows.length === 0) return [];
     const spotIds = spotRows.map((s) => s.id);
-    const epRows = await this.db
-      .select()
-      .from(spotEpisodes)
-      .where(inArray(spotEpisodes.spotId, spotIds));
+    const epRows: Array<typeof spotEpisodes.$inferSelect> = [];
+    const chunkSize = 500;
+    for (let i = 0; i < spotIds.length; i += chunkSize) {
+      const batchIds = spotIds.slice(i, i + chunkSize);
+      const batch = await this.db
+        .select()
+        .from(spotEpisodes)
+        .where(inArray(spotEpisodes.spotId, batchIds));
+      epRows.push(...batch);
+    }
 
     const epBySpot = new Map<string, SpotEpisode[]>();
     for (const ep of epRows) {
@@ -159,36 +165,49 @@ export class NeonPostgisRepository implements SeichiRepository {
   public async mergeAnonymousUserData(
     fromGuestUserId: string,
     toUserId: string,
-  ): Promise<void> {
-    if (fromGuestUserId === toUserId) return;
-    const guestVisits = await this.db
-      .select()
-      .from(visits)
-      .where(eq(visits.userId, fromGuestUserId));
+  ): Promise<{ r2KeysToDelete: string[] }> {
+    if (fromGuestUserId === toUserId) return { r2KeysToDelete: [] };
+    const [guestVisits, targetVisits] = await Promise.all([
+      this.db.select().from(visits).where(eq(visits.userId, fromGuestUserId)),
+      this.db.select().from(visits).where(eq(visits.userId, toUserId)),
+    ]);
+
+    const targetBySpot = new Map(targetVisits.map((v) => [v.spotId, v]));
+    const r2KeysToDelete: string[] = [];
 
     for (const gv of guestVisits) {
-      const existing = await this.db
-        .select()
-        .from(visits)
-        .where(and(eq(visits.userId, toUserId), eq(visits.spotId, gv.spotId)))
-        .limit(1);
-
-      if (!existing[0]) {
+      const ex = targetBySpot.get(gv.spotId);
+      if (!ex) {
         await this.db
           .update(visits)
           .set({ userId: toUserId })
           .where(eq(visits.id, gv.id));
-      } else if (gv.status === 'visited' && existing[0].status !== 'visited') {
+      } else {
+        const nextStatus =
+          gv.status === 'visited' || ex.status === 'visited' ? 'visited' : 'give_up';
+        const nextSelf = gv.selfDiscovered || ex.selfDiscovered;
+        const keepPhotoKey = ex.privatePhotoR2Key ?? gv.privatePhotoR2Key;
+        const keepPhotoMime = ex.privatePhotoMime ?? gv.privatePhotoMime;
+        if (
+          ex.privatePhotoR2Key &&
+          gv.privatePhotoR2Key &&
+          ex.privatePhotoR2Key !== gv.privatePhotoR2Key
+        ) {
+          r2KeysToDelete.push(gv.privatePhotoR2Key);
+        }
+
         await this.db
           .update(visits)
           .set({
-            status: 'visited',
-            selfDiscovered: gv.selfDiscovered || existing[0].selfDiscovered,
-            privateMemo: existing[0].privateMemo ?? gv.privateMemo,
-            privatePhotoR2Key: existing[0].privatePhotoR2Key ?? gv.privatePhotoR2Key,
-            privatePhotoMime: existing[0].privatePhotoMime ?? gv.privatePhotoMime,
+            status: nextStatus,
+            selfDiscovered: nextSelf,
+            privateMemo: ex.privateMemo ?? gv.privateMemo,
+            privatePhotoR2Key: keepPhotoKey,
+            privatePhotoMime: keepPhotoMime,
           })
-          .where(eq(visits.id, existing[0].id));
+          .where(eq(visits.id, ex.id));
+
+        await this.db.delete(visits).where(eq(visits.id, gv.id));
       }
     }
 
@@ -196,6 +215,13 @@ export class NeonPostgisRepository implements SeichiRepository {
       .update(spotComments)
       .set({ userId: toUserId })
       .where(eq(spotComments.userId, fromGuestUserId));
+
+    // 不要になった匿名ゲストユーザー行を削除（sessions 等も cascade 削除）
+    await this.db
+      .delete(users)
+      .where(and(eq(users.id, fromGuestUserId), eq(users.isAnonymous, true)));
+
+    return { r2KeysToDelete };
   }
 
   public async signUpOrLinkEmail(params: {
@@ -334,6 +360,26 @@ export class NeonPostgisRepository implements SeichiRepository {
     await this.db.delete(sessions).where(eq(sessions.token, token));
   }
 
+  public async issueSessionForUser(
+    userId: string,
+  ): Promise<{ user: AuthUser; sessionToken: string } | null> {
+    const [userRow] = await this.db
+      .select()
+      .from(users)
+      .where(eq(users.id, userId))
+      .limit(1);
+    if (!userRow) return null;
+
+    const token = `tok_${crypto.randomUUID()}${crypto.randomUUID().replace(/-/g, '')}`;
+    await this.db.insert(sessions).values({
+      id: `ses_${crypto.randomUUID()}`,
+      userId: userRow.id,
+      token,
+      expiresAt: new Date(Date.now() + 1000 * 60 * 60 * 24 * 90),
+    });
+    return { user: toAuthUser(userRow), sessionToken: token };
+  }
+
   public async updateUserSettings(
     userId: string,
     settings: ExplorerSettings,
@@ -438,6 +484,7 @@ export class NeonPostgisRepository implements SeichiRepository {
     lat: number;
     lng: number;
     member?: string;
+    members?: string[];
     mediaCategory?: MediaCategory;
     prefecture?: string;
     tagQuery?: string;
@@ -451,11 +498,38 @@ export class NeonPostgisRepository implements SeichiRepository {
       conditions.push(eq(spots.prefecture, params.prefecture));
     }
 
-    // GiST KNN (<->) を用いた高速空間検索（フィルタがある場合は広めに候補を引いて正確に絞り込む）
-    const fetchLimit =
-      params.member || params.mediaCategory || params.tagQuery
-        ? Math.max((params.limit ?? 200) * 6, 1200)
-        : (params.limit ?? 200);
+    const memberFilterList = params.members?.length
+      ? params.members
+      : params.member
+        ? [params.member]
+        : [];
+    if (memberFilterList.length > 0) {
+      const memberOr = or(
+        ...memberFilterList.map(
+          (m) => sql`${spotEpisodes.members} @> ${JSON.stringify([m])}::jsonb`,
+        ),
+      );
+      conditions.push(
+        sql`EXISTS (SELECT 1 FROM ${spotEpisodes} WHERE ${spotEpisodes.spotId} = ${spots.id} AND (${memberOr}))`,
+      );
+    }
+
+    if (params.mediaCategory) {
+      conditions.push(
+        sql`EXISTS (SELECT 1 FROM ${spotEpisodes} WHERE ${spotEpisodes.spotId} = ${spots.id} AND ${spotEpisodes.mediaCategory} = ${params.mediaCategory})`,
+      );
+    }
+
+    const q = params.tagQuery?.trim();
+    if (q) {
+      const pattern = `%${q.replace(/[%_\\]/g, '\\$&')}%`;
+      conditions.push(
+        sql`(${spots.prefecture} ILIKE ${pattern} OR EXISTS (SELECT 1 FROM ${spotEpisodes} WHERE ${spotEpisodes.spotId} = ${spots.id} AND (${spotEpisodes.hashtags}::text ILIKE ${pattern} OR ${spotEpisodes.members}::text ILIKE ${pattern})))`,
+      );
+    }
+
+    // DB側で条件を完全に絞り込んでから GiST KNN (<->) で距離順上位を取得（地方スポットの検索漏れゼロ）
+    const fetchLimit = params.limit ?? 200;
 
     const rows = await this.db
       .select({
@@ -469,36 +543,11 @@ export class NeonPostgisRepository implements SeichiRepository {
 
     const hydrated = await this.hydrateSpotsWithEpisodes(rows.map((r) => r.spot));
     const distById = new Map(rows.map((r) => [r.spot.id, r.distanceMeters]));
-    const q = params.tagQuery?.trim().toLowerCase();
 
-    const filtered: Array<{ spot: Spot; distanceMeters: number }> = [];
-    for (const spot of hydrated) {
-      if (params.member && !spot.episodes.some((e) => e.members.includes(params.member!))) {
-        continue;
-      }
-      if (
-        params.mediaCategory &&
-        !spot.episodes.some((e) => e.mediaCategory === params.mediaCategory)
-      ) {
-        continue;
-      }
-      if (q) {
-        const hit =
-          spot.prefecture.toLowerCase().includes(q) ||
-          spot.episodes.some(
-            (ep) =>
-              ep.hashtags.some((h) => h.toLowerCase().includes(q)) ||
-              ep.members.some((m) => m.toLowerCase().includes(q)),
-          );
-        if (!hit) continue;
-      }
-      filtered.push({
-        spot,
-        distanceMeters: distById.get(spot.id) ?? 0,
-      });
-    }
-
-    return params.limit ? filtered.slice(0, params.limit) : filtered;
+    return hydrated.map((spot) => ({
+      spot,
+      distanceMeters: distById.get(spot.id) ?? 0,
+    }));
   }
 
   public async findNearbyDuplicates(
@@ -618,9 +667,22 @@ export class NeonPostgisRepository implements SeichiRepository {
     return this.getSpotById(spotId);
   }
 
-  public async deleteSpot(spotId: string): Promise<boolean> {
-    await this.db.delete(spots).where(eq(spots.id, spotId));
-    return true;
+  public async deleteSpot(
+    spotId: string,
+  ): Promise<{ deleted: boolean; r2KeysToDelete: string[] }> {
+    const visitPhotos = await this.db
+      .select({ r2Key: visits.privatePhotoR2Key })
+      .from(visits)
+      .where(eq(visits.spotId, spotId));
+    const r2KeysToDelete = visitPhotos
+      .map((v) => v.r2Key)
+      .filter((k): k is string => Boolean(k));
+
+    const deletedRows = await this.db
+      .delete(spots)
+      .where(eq(spots.id, spotId))
+      .returning({ id: spots.id });
+    return { deleted: deletedRows.length > 0, r2KeysToDelete };
   }
 
   public async bulkImportCandidates(
@@ -723,40 +785,8 @@ export class NeonPostgisRepository implements SeichiRepository {
     const spot = await this.getSpotById(params.spotId);
     if (!spot) throw new Error('Spot not found');
 
-    const [existing] = await this.db
-      .select()
-      .from(visits)
-      .where(and(eq(visits.userId, params.userId), eq(visits.spotId, params.spotId)))
-      .limit(1);
-
-    if (existing) {
-      const nextStatus =
-        existing.status === 'visited' || params.status === 'visited'
-          ? 'visited'
-          : 'give_up';
-      const nextSelf = existing.selfDiscovered || params.selfDiscovered;
-      const [updated] = await this.db
-        .update(visits)
-        .set({ status: nextStatus, selfDiscovered: nextSelf })
-        .where(eq(visits.id, existing.id))
-        .returning();
-
-      return {
-        id: updated!.id,
-        userId: updated!.userId,
-        spotId: updated!.spotId,
-        spotTitle: spot.title,
-        prefecture: spot.prefecture,
-        status: nextStatus,
-        selfDiscovered: nextSelf,
-        privateMemo: updated!.privateMemo ?? undefined,
-        hasPrivatePhoto: Boolean(updated!.privatePhotoR2Key),
-        visitedAt: updated!.visitedAt.toISOString(),
-      };
-    }
-
     const id = `vis_${crypto.randomUUID()}`;
-    const [created] = await this.db
+    const [upserted] = await this.db
       .insert(visits)
       .values({
         id,
@@ -765,18 +795,26 @@ export class NeonPostgisRepository implements SeichiRepository {
         status: params.status,
         selfDiscovered: params.selfDiscovered,
       })
+      .onConflictDoUpdate({
+        target: [visits.userId, visits.spotId],
+        set: {
+          status: sql`CASE WHEN ${visits.status} = 'visited' OR ${params.status} = 'visited' THEN 'visited' ELSE 'give_up' END`,
+          selfDiscovered: sql`${visits.selfDiscovered} OR ${params.selfDiscovered}`,
+        },
+      })
       .returning();
 
     return {
-      id: created!.id,
-      userId: created!.userId,
-      spotId: created!.spotId,
+      id: upserted!.id,
+      userId: upserted!.userId,
+      spotId: upserted!.spotId,
       spotTitle: spot.title,
       prefecture: spot.prefecture,
-      status: params.status,
-      selfDiscovered: params.selfDiscovered,
-      hasPrivatePhoto: false,
-      visitedAt: created!.visitedAt.toISOString(),
+      status: upserted!.status === 'visited' ? 'visited' : 'give_up',
+      selfDiscovered: upserted!.selfDiscovered,
+      privateMemo: upserted!.privateMemo ?? undefined,
+      hasPrivatePhoto: Boolean(upserted!.privatePhotoR2Key),
+      visitedAt: upserted!.visitedAt.toISOString(),
     };
   }
 

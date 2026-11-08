@@ -47,7 +47,7 @@ export function maskSpotTitle(spotId: string, title: string, level: MaskLevel): 
   chars.forEach((ch, idx) => {
     const symbol = MASK_SYMBOLS[Math.floor(rng() * MASK_SYMBOLS.length)] ?? '〇';
     symbolChoicePerIndex.set(idx, symbol);
-    if (!/[\s　・()（）「」『』/／\-ー]/.test(ch)) {
+    if (!/[\s　・()（）「」『』/／\-]/.test(ch)) {
       maskableIndices.push(idx);
     }
   });

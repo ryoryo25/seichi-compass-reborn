@@ -65,6 +65,21 @@ export const ExplorerSettingsSchema = z.object({
 });
 export type ExplorerSettings = z.infer<typeof ExplorerSettingsSchema>;
 
+export const UserRoleSchema = z.enum(['user', 'admin']);
+export type UserRoleType = z.infer<typeof UserRoleSchema>;
+
+export const AuthUserSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  email: z.string().nullable().optional(),
+  isAnonymous: z.boolean(),
+  role: UserRoleSchema,
+  publicProfileStats: z.boolean().default(true),
+  settings: ExplorerSettingsSchema,
+  createdAt: z.string(),
+});
+export type AuthUser = z.infer<typeof AuthUserSchema>;
+
 export const SpotEpisodeSchema = z.object({
   id: z.string(),
   spotId: z.string(),
@@ -97,9 +112,20 @@ export type Spot = z.infer<typeof SpotSchema>;
 export const VisitStatusSchema = z.enum(['unvisited', 'visited', 'give_up']);
 export type VisitStatus = z.infer<typeof VisitStatusSchema>;
 
-/**
- * 到着前クライアントへ返却する虫食いサマリ（ネタバレ情報を含まない）
- */
+export const VisitRecordSchema = z.object({
+  id: z.string(),
+  userId: z.string(),
+  spotId: z.string(),
+  spotTitle: z.string(),
+  prefecture: z.string(),
+  status: z.enum(['visited', 'give_up']),
+  selfDiscovered: z.boolean(),
+  privateMemo: z.string().optional(),
+  hasPrivatePhoto: z.boolean().default(false),
+  visitedAt: z.string(),
+});
+export type VisitRecord = z.infer<typeof VisitRecordSchema>;
+
 export const MaskedSpotSummarySchema = z.object({
   id: z.string(),
   displayTitle: z.string(),
@@ -114,10 +140,8 @@ export const MaskedSpotSummarySchema = z.object({
   visibleMediaCategories: z.array(MediaCategorySchema),
   visibleMembers: z.array(z.string()),
   visibleHashtags: z.array(z.string()),
-  /** 宝探しモード用のぼかしレーダー座標 */
   radarLat: z.number(),
   radarLng: z.number(),
-  /** 達成済み・ギブアップ済み・または通常聖地マップモード時のみ正確な座標を返す */
   exactLat: z.number().optional(),
   exactLng: z.number().optional(),
 });
@@ -137,12 +161,58 @@ export const CreateSpotInputSchema = z.object({
 });
 export type CreateSpotInput = z.infer<typeof CreateSpotInputSchema>;
 
+export const UpdateSpotInputSchema = z.object({
+  title: z.string().min(1).max(120).optional(),
+  lat: z.number().min(-90).max(90).optional(),
+  lng: z.number().min(-180).max(180).optional(),
+  arrivalRadiusMeters: z.number().int().min(30).max(500).optional(),
+});
+export type UpdateSpotInput = z.infer<typeof UpdateSpotInputSchema>;
+
 export const SpotCommentSchema = z.object({
   id: z.string(),
   spotId: z.string(),
+  userId: z.string().optional(),
   authorName: z.string(),
   content: z.string().min(1).max(300),
   isPublic: z.boolean(),
   createdAt: z.string(),
 });
 export type SpotComment = z.infer<typeof SpotCommentSchema>;
+
+export const SpotReportReasonSchema = z.enum([
+  'wrong_location',
+  'duplicate',
+  'unsafe_url',
+  'inappropriate',
+  'closed_or_changed',
+  'other',
+]);
+export type SpotReportReason = z.infer<typeof SpotReportReasonSchema>;
+
+export const SpotReportSchema = z.object({
+  id: z.string(),
+  spotId: z.string(),
+  spotTitle: z.string().optional(),
+  reporterUserId: z.string(),
+  reason: SpotReportReasonSchema,
+  detail: z.string().max(500).optional(),
+  status: z.enum(['open', 'resolved', 'dismissed']).default('open'),
+  createdAt: z.string(),
+});
+export type SpotReport = z.infer<typeof SpotReportSchema>;
+
+export const PublicUserAchievementsSchema = z.object({
+  userId: z.string(),
+  nickname: z.string(),
+  visitedCount: z.number(),
+  selfDiscoveredCount: z.number(),
+  prefecturesVisited: z.number(),
+  topPrefectures: z.array(
+    z.object({
+      prefecture: z.string(),
+      count: z.number(),
+    }),
+  ),
+});
+export type PublicUserAchievements = z.infer<typeof PublicUserAchievementsSchema>;

@@ -47,4 +47,4 @@ npm run dev:mobile
    npm run deploy:api
    ```
 
-詳細なアーキテクチャ・セキュリティ設計は [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) を参照してください。
+詳細なアーキテクチャ・セキュリティ設計は [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md)、本番デプロイおよび iOS/Android 単体アプリのビルド手順は [docs/DEPLOYMENT.md](./docs/DEPLOYMENT.md) を参照してください。

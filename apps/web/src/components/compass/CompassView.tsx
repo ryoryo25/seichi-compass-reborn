@@ -16,6 +16,7 @@ function bearingToJapaneseDirection(deg: number): string {
 export interface CompassViewProps {
   spot: MaskedSpotSummary;
   deviceHeadingDeg: number;
+  devicePitchDeg?: number;
   isDemoMode: boolean;
   isUnlocking: boolean;
   needsCompassPermission?: boolean;
@@ -30,6 +31,7 @@ export interface CompassViewProps {
 export function CompassView({
   spot,
   deviceHeadingDeg,
+  devicePitchDeg = 0,
   isDemoMode,
   isUnlocking,
   needsCompassPermission = false,
@@ -43,6 +45,13 @@ export function CompassView({
   const canArrive = spot.distanceMeters <= spot.arrivalRadiusMeters;
   const relativeAngle = (spot.bearingDeg - deviceHeadingDeg + 360) % 360;
   const directionText = bearingToJapaneseDirection(spot.bearingDeg);
+
+  // SeichiCompass-Android (CompassFragment.kt) の3D傾き補正:
+  // rotationX = -grad.toFloat()
+  // scaleY = (0.3 * (1 - abs(averageAngles[1])) + 0.5).toFloat()
+  const clampedPitchDeg = Math.max(-75, Math.min(75, devicePitchDeg));
+  const pitchRad = (clampedPitchDeg * Math.PI) / 180;
+  const needleScaleY = 0.3 * (1 - Math.min(1, Math.abs(pitchRad))) + 0.5;
 
   return (
     <div className="bg-white rounded-3xl border border-sky-100 shadow-sm p-5 sm:p-7 max-w-xl mx-auto">
@@ -107,12 +116,15 @@ export function CompassView({
         </div>
       </div>
 
-      {/* コンパスダイヤル（スライド15・22のデザインをモダンに再現） */}
-      <div className="relative w-64 h-64 sm:w-72 sm:h-72 mx-auto my-6 flex items-center justify-center">
+      {/* コンパスダイヤル（SeichiCompass-Android の fragment_compass.xml & compass.png を忠実再現） */}
+      <div
+        className="relative w-64 h-64 sm:w-72 sm:h-72 mx-auto my-6 flex items-center justify-center"
+        style={{ perspective: '600px' }}
+      >
         <div
           className={`absolute inset-0 rounded-full border-4 transition-colors duration-500 ${
             canArrive
-              ? 'border-amber-400 bg-amber-50/40 shadow-[0_0_40px_rgba(251,191,36,0.35)]'
+              ? 'border-emerald-400 bg-emerald-50/40 shadow-[0_0_40px_rgba(16,185,129,0.3)]'
               : 'border-sky-100 bg-gradient-to-b from-sky-50/60 to-white'
           }`}
         />
@@ -136,29 +148,27 @@ export function CompassView({
           </span>
         </div>
 
-        {/* 聖地の方向を指すダイヤモンド針 */}
+        {/* SeichiCompass-Android オリジナルの赤白ひし形コンパス針 (compass.png) */}
         <div
-          className="relative w-44 h-44 transition-transform duration-300 ease-out flex items-center justify-center"
-          style={{ transform: `rotate(${relativeAngle}deg)` }}
+          className="relative w-52 h-52 flex items-center justify-center transition-transform duration-150 ease-out"
+          style={{
+            transform: `rotateX(${-clampedPitchDeg}deg) rotate(${relativeAngle}deg) scaleX(0.5) scaleY(${needleScaleY})`,
+          }}
         >
-          <svg viewBox="0 0 120 120" className="w-full h-full drop-shadow-md">
-            {/* 先端（赤/空色：聖地の方向） */}
-            <polygon
-              points="60,8 84,60 60,52 36,60"
-              fill={canArrive ? '#f59e0b' : '#ef4444'}
-              stroke="#1e293b"
-              strokeWidth="1.5"
-            />
-            {/* 後端（白） */}
-            <polygon
-              points="60,112 84,60 60,68 36,60"
-              fill="#ffffff"
-              stroke="#64748b"
-              strokeWidth="1.5"
-            />
-            <circle cx="60" cy="60" r="5" fill="#0f172a" />
-          </svg>
+          <img
+            src="/compass.png"
+            alt="聖地コンパス針"
+            className="w-full h-full object-fill select-none pointer-events-none drop-shadow-md"
+          />
         </div>
+      </div>
+
+      {/* SeichiCompass-Android の「聖地まで」「%1$s m」表示 */}
+      <div className="text-center mb-5">
+        <p className="text-2xl font-black text-slate-900">聖地まで</p>
+        <p className="text-4xl font-black text-sky-900 tabular-nums mt-0.5">
+          {Math.round(spot.distanceMeters).toLocaleString()} m
+        </p>
       </div>
 
       {needsCompassPermission && !isDemoMode && (

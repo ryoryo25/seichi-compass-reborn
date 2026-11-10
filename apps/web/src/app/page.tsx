@@ -68,6 +68,22 @@ export default function HomePage() {
   const [userLat, setUserLat] = useState(DEMO_LOCATION_PRESETS[0]!.lat);
   const [userLng, setUserLng] = useState(DEMO_LOCATION_PRESETS[0]!.lng);
   const [deviceHeadingDeg, setDeviceHeadingDeg] = useState(0);
+  const [devicePitchDeg, setDevicePitchDeg] = useState(0);
+
+  // SeichiCompass-Android (CompassFragment.kt) の historySize = 10 移動平均フィルタ
+  const headingHistoryRef = useRef<{
+    sin: number[];
+    cos: number[];
+    pitch: number[];
+    pos: number;
+    count: number;
+  }>({
+    sin: new Array(10).fill(0),
+    cos: new Array(10).fill(1),
+    pitch: new Array(10).fill(0),
+    pos: 0,
+    count: 0,
+  });
 
   // メタ情報 & 機能フラグ
   const [meta, setMeta] = useState<{
@@ -182,11 +198,36 @@ export default function HomePage() {
     const webkitHeading = (
       event as DeviceOrientationEvent & { webkitCompassHeading?: number }
     ).webkitCompassHeading;
-    if (typeof webkitHeading === 'number') {
-      setDeviceHeadingDeg(webkitHeading);
-    } else if (typeof event.alpha === 'number') {
-      setDeviceHeadingDeg((360 - event.alpha) % 360);
+    const rawHeading =
+      typeof webkitHeading === 'number'
+        ? webkitHeading
+        : typeof event.alpha === 'number'
+          ? (360 - event.alpha) % 360
+          : null;
+    if (rawHeading === null) return;
+
+    const hist = headingHistoryRef.current;
+    const rad = (rawHeading * Math.PI) / 180;
+    hist.sin[hist.pos] = Math.sin(rad);
+    hist.cos[hist.pos] = Math.cos(rad);
+    hist.pitch[hist.pos] = typeof event.beta === 'number' ? event.beta : 0;
+    hist.pos = (hist.pos + 1) % 10;
+    hist.count = Math.min(10, hist.count + 1);
+
+    let sumSin = 0;
+    let sumCos = 0;
+    let sumPitch = 0;
+    for (let i = 0; i < hist.count; i++) {
+      sumSin += hist.sin[i]!;
+      sumCos += hist.cos[i]!;
+      sumPitch += hist.pitch[i]!;
     }
+    const avgHeading =
+      ((Math.atan2(sumSin / hist.count, sumCos / hist.count) * 180) / Math.PI +
+        360) %
+      360;
+    setDeviceHeadingDeg(avgHeading);
+    setDevicePitchDeg(sumPitch / hist.count);
   }, []);
 
   const handleRequestCompassPermission = useCallback(async () => {
@@ -748,6 +789,7 @@ export default function HomePage() {
               <CompassView
                 spot={activeCompassSpot}
                 deviceHeadingDeg={deviceHeadingDeg}
+                devicePitchDeg={devicePitchDeg}
                 isDemoMode={isDemoMode && meta.enableDemoSimulator}
                 isUnlocking={isUnlocking}
                 needsCompassPermission={needsCompassPermission}

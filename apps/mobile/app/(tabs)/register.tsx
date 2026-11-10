@@ -5,6 +5,7 @@ import {
   type PlaceSearchCandidate,
   validateAndParseReferenceUrl,
 } from '@seichi/shared';
+import * as Linking from 'expo-linking';
 import { useRouter } from 'expo-router';
 import { useCallback, useEffect, useState } from 'react';
 import {
@@ -212,9 +213,17 @@ export default function RegisterSpotScreen() {
 
       {/* Step 1: Googleマップ共有URL または 施設名検索 */}
       <View style={styles.section}>
-        <Text style={styles.sectionTitle}>
-          1. Googleマップ共有URL または 場所検索
-        </Text>
+        <View style={styles.stepHeaderRow}>
+          <Text style={styles.sectionTitle}>
+            1. Googleマップ共有URL または 場所検索
+          </Text>
+          <Pressable
+            style={styles.openMapBtn}
+            onPress={() => void Linking.openURL('https://www.google.com/maps')}
+          >
+            <Text style={styles.openMapBtnText}>🗺️ Mapアプリを開く</Text>
+          </Pressable>
+        </View>
         <View style={styles.inputRow}>
           <TextInput
             style={[styles.input, { flex: 1 }]}
@@ -456,7 +465,20 @@ const styles = StyleSheet.create({
     borderColor: '#e2e8f0',
     gap: 8,
   },
-  sectionTitle: { fontSize: 14, fontWeight: '800', color: '#0c4a6e' },
+  sectionTitle: { fontSize: 14, fontWeight: '800', color: '#0c4a6e', flexShrink: 1 },
+  stepHeaderRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    gap: 8,
+  },
+  openMapBtn: {
+    backgroundColor: '#e0f2fe',
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 999,
+  },
+  openMapBtnText: { fontSize: 11, fontWeight: '700', color: '#0369a1' },
   inputRow: { flexDirection: 'row', gap: 8 },
   input: {
     backgroundColor: '#f8fafc',

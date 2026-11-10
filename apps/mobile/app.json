@@ -3,6 +3,7 @@
     "name": "聖地コンパス Reborn",
     "slug": "seichi-compass-reborn",
     "version": "0.2.0",
+    "icon": "./assets/icon.png",
     "orientation": "portrait",
     "scheme": "seichicompass",
     "userInterfaceStyle": "light",

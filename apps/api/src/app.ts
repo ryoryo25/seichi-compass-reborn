@@ -134,6 +134,13 @@ function resolveAllowedCorsOrigin(
     allowlist.add('http://localhost:8081');
     allowlist.add('http://127.0.0.1:8081');
     allowlist.add('http://localhost:8787');
+    if (
+      /^http:\/\/(192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[0-1])\.\d+\.\d+)(:\d+)?$/.test(
+        requestOrigin,
+      )
+    ) {
+      return requestOrigin;
+    }
   }
 
   return allowlist.has(requestOrigin) ? requestOrigin : null;

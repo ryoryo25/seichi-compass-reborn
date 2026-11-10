@@ -16,6 +16,7 @@ import type {
   TagVisibility,
   VisitRecord,
 } from '@seichi/shared';
+import Constants from 'expo-constants';
 import * as SecureStore from 'expo-secure-store';
 
 export type {
@@ -26,9 +27,19 @@ export type {
 
 const SESSION_TOKEN_KEY = 'seichi_bearer_token_v1';
 
-export const API_BASE_URL =
-  process.env.EXPO_PUBLIC_API_URL?.replace(/\/$/, '') ??
-  'http://localhost:3000/api';
+function resolveDefaultApiBaseUrl(): string {
+  const envUrl = process.env.EXPO_PUBLIC_API_URL?.replace(/\/$/, '');
+  if (envUrl) return envUrl;
+
+  // Expo Go 実機接続時は Metro Bundler のホストIP (例: 192.168.x.x:8081) から API サーバー (:3000) を自動推定
+  const debuggerHost = Constants.expoConfig?.hostUri?.split(':')[0];
+  if (debuggerHost) {
+    return `http://${debuggerHost}:3000/api`;
+  }
+  return 'http://localhost:3000/api';
+}
+
+export const API_BASE_URL = resolveDefaultApiBaseUrl();
 
 let cachedToken: string | null = null;
 

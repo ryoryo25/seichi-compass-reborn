@@ -1,5 +1,4 @@
 import {
-  formatDistance,
   MEDIA_CATEGORY_META,
   type MaskedSpotSummary,
   type Spot,
@@ -26,6 +25,10 @@ import {
 } from 'react-native';
 import { mobileApi } from '@/api/client.ts';
 import { useApp } from '@/context/AppContext.tsx';
+
+// SeichiCompass-Android (CompassFragment.kt) の historySize = 10 移動平均フィルタを再現
+const COMPASS_HISTORY_SIZE = 10;
+const compassNeedleImage = require('../../assets/compass.png');
 
 export default function NativeCompassScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
@@ -79,7 +82,18 @@ export default function NativeCompassScreen() {
   const [busy, setBusy] = useState(false);
 
   const hapticTriggeredRef = useRef(false);
+  const autoUnlockTriggeredRef = useRef(false);
   const loadedUnlockedSpotRef = useRef<string | null>(null);
+
+  // SeichiCompass-Android (CompassFragment.kt) の anglesHistory (historySize = 10) リングバッファ
+  const headingSinHistoryRef = useRef<number[]>(
+    new Array(COMPASS_HISTORY_SIZE).fill(0),
+  );
+  const headingCosHistoryRef = useRef<number[]>(
+    new Array(COMPASS_HISTORY_SIZE).fill(1),
+  );
+  const headingHistoryPosRef = useRef(0);
+  const headingHistoryCountRef = useRef(0);
 
   // ディープリンクやプッシュ通知で最寄り250件外の聖地が開かれた場合も単体サマリを取得
   useEffect(() => {
@@ -115,26 +129,51 @@ export default function NativeCompassScreen() {
     settings.mapMode,
   ]);
 
-  // 1. 電子磁気コンパス（60fps滑らかな方角追従） + 高精度GPS距離更新
+  // 1. 電子磁気コンパス（SeichiCompass-Android 同様の10サンプル移動平均フィルタ） + 高精度GPS距離更新
   useEffect(() => {
     let headingSub: Location.LocationSubscription | null = null;
     let posSub: Location.LocationSubscription | null = null;
+
+    headingHistoryPosRef.current = 0;
+    headingHistoryCountRef.current = 0;
+    headingSinHistoryRef.current.fill(0);
+    headingCosHistoryRef.current.fill(1);
 
     void (async () => {
       const perm = await Location.requestForegroundPermissionsAsync();
       if (perm.status !== 'granted') return;
 
       headingSub = await Location.watchHeadingAsync((heading) => {
-        const deg =
+        const rawDeg =
           heading.trueHeading >= 0 ? heading.trueHeading : heading.magHeading;
-        setDeviceHeadingDeg(deg);
+        const rad = (rawDeg * Math.PI) / 180;
+        const pos = headingHistoryPosRef.current;
+        headingSinHistoryRef.current[pos] = Math.sin(rad);
+        headingCosHistoryRef.current[pos] = Math.cos(rad);
+        headingHistoryPosRef.current = (pos + 1) % COMPASS_HISTORY_SIZE;
+        headingHistoryCountRef.current = Math.min(
+          COMPASS_HISTORY_SIZE,
+          headingHistoryCountRef.current + 1,
+        );
+
+        const count = headingHistoryCountRef.current;
+        let sumSin = 0;
+        let sumCos = 0;
+        for (let i = 0; i < count; i++) {
+          sumSin += headingSinHistoryRef.current[i]!;
+          sumCos += headingCosHistoryRef.current[i]!;
+        }
+        const avgDeg =
+          ((Math.atan2(sumSin / count, sumCos / count) * 180) / Math.PI + 360) %
+          360;
+        setDeviceHeadingDeg(avgDeg);
       });
 
       posSub = await Location.watchPositionAsync(
         {
           accuracy: Location.Accuracy.BestForNavigation,
-          distanceInterval: 3,
-          timeInterval: 2500,
+          distanceInterval: 1,
+          timeInterval: 1000,
         },
         (loc) => {
           setLivePos({
@@ -151,6 +190,40 @@ export default function NativeCompassScreen() {
     };
   }, []);
 
+  const handleUnlock = useCallback(
+    async (
+      mode: 'arrive' | 'give_up',
+      overridePos?: { lat: number; lng: number },
+    ) => {
+      setBusy(true);
+      try {
+        const targetPos = overridePos ?? livePos;
+        const res = await mobileApi.unlockSpot(spotId, {
+          userLat: targetPos.lat,
+          userLng: targetPos.lng,
+          mode,
+          mapMode: settings.mapMode,
+        });
+        setUnlockedSpot(res.spot);
+        setVisitRecord(res.visit);
+        setComments(res.comments);
+        void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+        await reloadSession();
+        await refreshSpots();
+      } catch (err) {
+        if (!overridePos) {
+          Alert.alert(
+            '解禁できませんでした',
+            err instanceof Error ? err.message : 'もう少し聖地に近づいてください',
+          );
+        }
+      } finally {
+        setBusy(false);
+      }
+    },
+    [spotId, livePos, settings.mapMode, reloadSession, refreshSpots],
+  );
+
   // 2. サーバーから現在地との正確な距離・方位を取得（未訪問でも正確な座標自体はクライアントへ渡さない）
   const syncBearing = useCallback(
     async (lat: number, lng: number) => {
@@ -161,20 +234,28 @@ export default function NativeCompassScreen() {
         setBearingDeg(res.bearingDeg);
         setArrivalRadiusMeters(res.arrivalRadiusMeters);
 
-        if (
-          res.distanceMeters <= res.arrivalRadiusMeters &&
-          !hapticTriggeredRef.current
-        ) {
-          hapticTriggeredRef.current = true;
-          void Haptics.notificationAsync(
-            Haptics.NotificationFeedbackType.Success,
-          );
+        if (res.distanceMeters <= res.arrivalRadiusMeters) {
+          if (!hapticTriggeredRef.current) {
+            hapticTriggeredRef.current = true;
+            void Haptics.notificationAsync(
+              Haptics.NotificationFeedbackType.Success,
+            );
+          }
+          // SeichiCompass-Android (CompassFragment.kt) 同様、到着圏内に入ったら自動で達成解禁
+          if (
+            !existingVisit &&
+            !unlockedSpot &&
+            !autoUnlockTriggeredRef.current
+          ) {
+            autoUnlockTriggeredRef.current = true;
+            void handleUnlock('arrive', { lat, lng });
+          }
         }
       } catch {
         // Ignore transient network errors
       }
     },
-    [spotId],
+    [spotId, existingVisit, unlockedSpot, handleUnlock],
   );
 
   useEffect(() => {
@@ -215,31 +296,6 @@ export default function NativeCompassScreen() {
 
   const relativeArrowAngle = (bearingDeg - deviceHeadingDeg + 360) % 360;
   const withinArrivalZone = distanceMeters <= arrivalRadiusMeters;
-
-  const handleUnlock = async (mode: 'arrive' | 'give_up') => {
-    setBusy(true);
-    try {
-      const res = await mobileApi.unlockSpot(spotId, {
-        userLat: livePos.lat,
-        userLng: livePos.lng,
-        mode,
-        mapMode: settings.mapMode,
-      });
-      setUnlockedSpot(res.spot);
-      setVisitRecord(res.visit);
-      setComments(res.comments);
-      void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-      await reloadSession();
-      await refreshSpots();
-    } catch (err) {
-      Alert.alert(
-        '解禁できませんでした',
-        err instanceof Error ? err.message : 'もう少し聖地に近づいてください',
-      );
-    } finally {
-      setBusy(false);
-    }
-  };
 
   const handleDemoApproach = async () => {
     try {
@@ -364,7 +420,7 @@ export default function NativeCompassScreen() {
 
   return (
     <ScrollView style={styles.container} contentContainerStyle={styles.content}>
-      {/* コンパスダイヤルカード */}
+      {/* コンパスダイヤルカード（SeichiCompass-Android の fragment_compass.xml を忠実再現） */}
       <View style={styles.compassCard}>
         <Text style={styles.prefPill}>
           {unlockedSpot?.prefecture ?? summary?.prefecture ?? '聖地探索'}
@@ -373,22 +429,32 @@ export default function NativeCompassScreen() {
           {unlockedSpot ? unlockedSpot.title : (summary?.displayTitle ?? '？？？')}
         </Text>
 
+        {/* 赤・白のひし形コンパス針 (compass.png, scaleX=0.5 / scaleY=0.8 比率) */}
         <View
           style={[
             styles.compassDial,
             withinArrivalZone && styles.compassDialArrived,
           ]}
         >
-          <Text
+          <View
             style={[
-              styles.compassNeedle,
+              styles.compassNeedleWrap,
               { transform: [{ rotate: `${relativeArrowAngle}deg` }] },
             ]}
           >
-            ⬆️
-          </Text>
-          <Text style={styles.distanceBig}>
-            {formatDistance(distanceMeters)}
+            <Image
+              source={compassNeedleImage}
+              style={styles.compassNeedleImage}
+              resizeMode="stretch"
+            />
+          </View>
+        </View>
+
+        {/* SeichiCompass-Android の「聖地まで」「%1$s m」表示 */}
+        <View style={styles.toSeichiBlock}>
+          <Text style={styles.toSeichiLabel}>聖地まで</Text>
+          <Text style={styles.seichiDistanceText}>
+            {Math.round(distanceMeters).toLocaleString()} m
           </Text>
           <Text style={styles.arrivalHint}>
             {withinArrivalZone
@@ -410,8 +476,8 @@ export default function NativeCompassScreen() {
             >
               <Text style={styles.arriveBtnText}>
                 {visitRecord?.status === 'give_up'
-                  ? '🎉 現地に到着して「訪問達成」へ昇格する！'
-                  : '🎉 聖地に到着！封印を解く'}
+                  ? '🎉 聖地を発見！（訪問達成へ昇格）'
+                  : '🎉 聖地を発見！'}
               </Text>
             </Pressable>
 
@@ -641,33 +707,54 @@ const styles = StyleSheet.create({
     textAlign: 'center',
   },
   compassDial: {
-    width: 220,
-    height: 220,
-    borderRadius: 110,
-    backgroundColor: '#f0f9ff',
-    borderWidth: 5,
-    borderColor: '#38bdf8',
+    width: 240,
+    height: 240,
+    borderRadius: 120,
+    backgroundColor: '#ffffff',
+    borderWidth: 4,
+    borderColor: '#e0f2fe',
     justifyContent: 'center',
     alignItems: 'center',
-    marginVertical: 18,
-    padding: 12,
+    marginTop: 16,
+    marginBottom: 10,
   },
   compassDialArrived: {
     backgroundColor: '#ecfdf5',
     borderColor: '#10b981',
   },
-  compassNeedle: { fontSize: 54 },
-  distanceBig: {
+  compassNeedleWrap: {
+    width: 190,
+    height: 190,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  compassNeedleImage: {
+    // SeichiCompass-Android fragment_compass.xml の scaleX="0.5", scaleY="0.8" を再現
+    width: 110,
+    height: 185,
+  },
+  toSeichiBlock: {
+    alignItems: 'center',
+    marginBottom: 16,
+  },
+  toSeichiLabel: {
     fontSize: 28,
+    fontWeight: '800',
+    color: '#0f172a',
+    textAlign: 'center',
+  },
+  seichiDistanceText: {
+    fontSize: 34,
     fontWeight: '900',
     color: '#0c4a6e',
-    marginTop: 6,
+    textAlign: 'center',
+    marginTop: 2,
   },
   arrivalHint: {
     fontSize: 11,
     color: '#475569',
     textAlign: 'center',
-    marginTop: 4,
+    marginTop: 6,
     fontWeight: '600',
   },
   actionGroup: { width: '100%', gap: 8 },

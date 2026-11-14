@@ -90,8 +90,12 @@ export function RegisterSpotPanel({
   const [importStatus, setImportStatus] = useState<string | null>(null);
   const [openReports, setOpenReports] = useState<SpotReport[]>([]);
 
-  // 座標変更時に半径60m以内の重複スポットを自動照会
+  // 座標変更時に半径60m以内の重複スポットを自動照会（ログイン済みユーザーのみ）
   useEffect(() => {
+    if (isGuest) {
+      setDuplicates([]);
+      return;
+    }
     let cancelled = false;
     const checkDuplicates = async () => {
       try {
@@ -115,7 +119,7 @@ export function RegisterSpotPanel({
     return () => {
       cancelled = true;
     };
-  }, [lat, lng, selectedExistingSpotId]);
+  }, [lat, lng, selectedExistingSpotId, isGuest]);
 
   // 管理者の場合は未対応通報一覧を取得
   useEffect(() => {

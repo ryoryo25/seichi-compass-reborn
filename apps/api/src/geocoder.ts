@@ -17,7 +17,7 @@ export async function searchPlacesByQuery(
   query: string,
   googleMapsApiKey?: string,
 ): Promise<PlaceSearchCandidate[]> {
-  const trimmed = query.trim();
+  const trimmed = query.trim().slice(0, 200);
   if (!trimmed) return [];
 
   if (googleMapsApiKey && googleMapsApiKey.trim() !== '') {
@@ -36,6 +36,7 @@ export async function searchPlacesByQuery(
           regionCode: 'JP',
           maxResultCount: 6,
         }),
+        signal: AbortSignal.timeout(5000),
       });
       if (res.ok) {
         const data = (await res.json()) as {
@@ -72,7 +73,9 @@ export async function searchPlacesByQuery(
     const gsiUrl = `https://msearch.gsi.go.jp/address-search/AddressSearch?q=${encodeURIComponent(
       trimmed,
     )}`;
-    const res = await fetch(gsiUrl);
+    const res = await fetch(gsiUrl, {
+      signal: AbortSignal.timeout(5000),
+    });
     if (res.ok) {
       const features = (await res.json()) as Array<{
         geometry?: { coordinates?: [number, number] };
@@ -124,6 +127,7 @@ async function expandGoogleMapsShortUrlSafely(initialUrl: string): Promise<strin
     const resp = await fetch(currentUrl, {
       method: 'GET',
       redirect: 'manual',
+      signal: AbortSignal.timeout(5000),
     });
     const locationHeader = resp.headers.get('location');
     if (!locationHeader || resp.status < 300 || resp.status >= 400) {

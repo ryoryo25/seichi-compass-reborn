@@ -112,14 +112,22 @@ export default function RegisterSpotScreen() {
     [checkNearbyDuplicates, title],
   );
 
-  // Googleマップアプリからの共有URL受信時に自動解決
+  // Googleマップアプリからの共有URL受信時に入力欄へセット（ログイン済みかつ正規GoogleマップURLの場合のみ座標解決）
   useEffect(() => {
     if (!pendingSharedUrl) return;
-    const shared = pendingSharedUrl;
+    const shared = pendingSharedUrl.trim();
     setPendingSharedUrl(null);
     setLocationInput(shared);
-    void handleResolveInput(shared);
-  }, [pendingSharedUrl, setPendingSharedUrl, handleResolveInput]);
+    if (
+      user &&
+      !user.isAnonymous &&
+      /^https:\/\/(?:maps\.app\.goo\.gl|goo\.gl\/maps|(?:www\.|maps\.)?google\.(?:com|co\.jp)\/maps)\b/i.test(
+        shared,
+      )
+    ) {
+      void handleResolveInput(shared);
+    }
+  }, [pendingSharedUrl, setPendingSharedUrl, handleResolveInput, user]);
 
   const toggleMember = (name: string) => {
     setSelectedMembers((prev) =>

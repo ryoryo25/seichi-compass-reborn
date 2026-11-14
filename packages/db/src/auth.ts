@@ -56,7 +56,7 @@ export function createBetterAuth(env: BetterAuthEnv) {
       schema,
     }),
     emailAndPassword: {
-      enabled: true,
+      enabled: false,
     },
     socialProviders,
     plugins: [

@@ -23,6 +23,7 @@ import {
   type MediaCategory,
   MediaCategorySchema,
   parseCsvToCandidates,
+  parseGoogleMapsUrl,
   parseKmlToCandidates,
   type Spot,
   SpotReportReasonSchema,
@@ -53,11 +54,52 @@ export interface ApiBindings {
   ALLOW_DEV_ROLE_SWITCH?: string;
   ENABLE_DEMO_SIMULATOR?: string;
   ALBUM_BUCKET?: R2LikeBucket;
+  R2_ACCOUNT_ID?: string;
+  R2_ACCESS_KEY_ID?: string;
+  R2_SECRET_ACCESS_KEY?: string;
+  R2_BUCKET_NAME?: string;
 }
 
 const SESSION_COOKIE_NAME = 'seichi_session';
 const OAUTH_GUEST_COOKIE_NAME = 'seichi_oauth_guest';
 const BETTER_AUTH_COOKIE_NAME = 'better-auth.session_token';
+const SAFE_SPOT_ID_REGEX = /^[a-zA-Z0-9_-]{1,80}$/;
+
+// スライディングウィンドウ方式のインメモリレートリミッタ（DoS / Denial of Wallet 対策）
+const rateLimitWindows = new Map<string, { count: number; resetAt: number }>();
+
+function checkRateLimit(
+  bucket: string,
+  clientKey: string,
+  maxRequests: number,
+  windowMs: number,
+): boolean {
+  const now = Date.now();
+  if (rateLimitWindows.size > 5000) {
+    for (const [k, v] of rateLimitWindows.entries()) {
+      if (v.resetAt <= now) rateLimitWindows.delete(k);
+    }
+  }
+  const key = `${bucket}:${clientKey}`;
+  const existing = rateLimitWindows.get(key);
+  if (!existing || existing.resetAt <= now) {
+    rateLimitWindows.set(key, { count: 1, resetAt: now + windowMs });
+    return true;
+  }
+  if (existing.count >= maxRequests) {
+    return false;
+  }
+  existing.count += 1;
+  return true;
+}
+
+function getClientIp(c: Context<{ Bindings: ApiBindings }>): string {
+  const cfIp = c.req.header('cf-connecting-ip');
+  if (cfIp) return cfIp.trim();
+  const xff = c.req.header('x-forwarded-for');
+  if (xff) return xff.split(',')[0]!.trim();
+  return 'local';
+}
 
 function getEnvValue<K extends keyof ApiBindings>(
   cEnv: ApiBindings | undefined,
@@ -72,13 +114,18 @@ function getEnvValue<K extends keyof ApiBindings>(
 
 /**
  * 開発用機能フラグ判定（フェイルクローズ設計）
+ * - NODE_ENV === 'production' の本番環境では環境変数ミスによる権限昇格を防ぐため ALLOW_DEV_ROLE_SWITCH を強制無効化。
  * - 明示的に "true" が指定された場合、または未設定かつローカル `NODE_ENV === 'development'` の場合のみ有効。
- * - 本番環境・Cloudflare Workers 等で環境変数が未設定の場合は必ず false になる。
  */
 function isDevFeatureEnabled(
   cEnv: ApiBindings | undefined,
   key: 'ALLOW_DEV_ROLE_SWITCH' | 'ENABLE_DEMO_SIMULATOR',
 ): boolean {
+  const isProdNodeEnv =
+    typeof process !== 'undefined' && process.env?.NODE_ENV === 'production';
+  if (isProdNodeEnv && key === 'ALLOW_DEV_ROLE_SWITCH') {
+    return false;
+  }
   const raw = getEnvValue(cEnv, key);
   if (raw === 'true') return true;
   if (raw === 'false') return false;
@@ -149,30 +196,63 @@ function resolveAllowedCorsOrigin(
 function extractRequestToken(
   authHeader: string | undefined,
   cookieToken: string | undefined,
-  betterAuthCookie?: string | undefined,
 ): string | undefined {
   if (authHeader?.startsWith('Bearer ')) {
     const bearer = authHeader.slice('Bearer '.length).trim();
     if (bearer) return bearer;
   }
   if (cookieToken) return cookieToken;
-  if (betterAuthCookie) {
-    // Better Auth signed cookie format: "<sessionToken>.<hmacSignature>"
-    const rawToken = decodeURIComponent(betterAuthCookie).split('.')[0]?.trim();
-    if (rawToken) return rawToken;
-  }
   return undefined;
+}
+
+function hasValidImageMagicBytes(bytes: Uint8Array, mime: string): boolean {
+  if (bytes.byteLength < 12) return false;
+  if (mime === 'image/jpeg') {
+    return bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
+  }
+  if (mime === 'image/png') {
+    return (
+      bytes[0] === 0x89 &&
+      bytes[1] === 0x50 &&
+      bytes[2] === 0x4e &&
+      bytes[3] === 0x47 &&
+      bytes[4] === 0x0d &&
+      bytes[5] === 0x0a &&
+      bytes[6] === 0x1a &&
+      bytes[7] === 0x0a
+    );
+  }
+  if (mime === 'image/webp') {
+    return (
+      bytes[0] === 0x52 &&
+      bytes[1] === 0x49 &&
+      bytes[2] === 0x46 &&
+      bytes[3] === 0x46 &&
+      bytes[8] === 0x57 &&
+      bytes[9] === 0x45 &&
+      bytes[10] === 0x42 &&
+      bytes[11] === 0x50
+    );
+  }
+  return false;
 }
 
 function decodeDataUrlToBytes(dataUrl: string): {
   bytes: Uint8Array;
-  mime: string;
+  mime: 'image/jpeg' | 'image/png' | 'image/webp';
 } {
-  const match = dataUrl.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,([\s\S]+)$/);
+  // SVG (image/svg+xml) 等のスクリプト実行可能な形式を厳格に拒否し、JPEG / PNG / WebP のみ許可
+  const match = dataUrl.match(
+    /^data:(image\/(?:jpeg|jpg|png|webp));base64,([\s\S]+)$/,
+  );
   if (!match) {
-    throw new Error('有効な画像データではありません');
+    throw new Error(
+      '対応していない画像形式です（JPEG / PNG / WebP のみアップロード可能です）',
+    );
   }
-  const mime = match[1]!;
+  const rawMime = match[1]!;
+  const mime: 'image/jpeg' | 'image/png' | 'image/webp' =
+    rawMime === 'image/jpg' ? 'image/jpeg' : (rawMime as 'image/jpeg' | 'image/png' | 'image/webp');
   const b64 = match[2]!;
   const binaryStr = atob(b64);
   const bytes = new Uint8Array(binaryStr.length);
@@ -181,6 +261,9 @@ function decodeDataUrlToBytes(dataUrl: string): {
   }
   if (bytes.byteLength > 5 * 1024 * 1024) {
     throw new Error('画像サイズは5MB以下にしてください');
+  }
+  if (!hasValidImageMagicBytes(bytes, mime)) {
+    throw new Error('画像ファイルのシグネチャ（マジックバイト）が不正です');
   }
   return { bytes, mime };
 }
@@ -294,10 +377,56 @@ export function createApiApp() {
     }),
   );
 
+  // CSRF 防御ミドルウェア（Cookie 認証での状態変更リクエストに対する Origin / Sec-Fetch-Site 検証）
+  app.use('*', async (c, next) => {
+    const method = c.req.method.toUpperCase();
+    if (
+      method === 'POST' ||
+      method === 'PUT' ||
+      method === 'PATCH' ||
+      method === 'DELETE'
+    ) {
+      const hasBearer = c.req.header('Authorization')?.startsWith('Bearer ');
+      if (!hasBearer) {
+        const secFetchSite = c.req.header('Sec-Fetch-Site');
+        if (secFetchSite === 'cross-site') {
+          return c.json(
+            { error: 'Cross-site state-changing request forbidden (CSRF)' },
+            403,
+          );
+        }
+        const origin = c.req.header('Origin');
+        if (origin) {
+          let reqOrigin = '';
+          try {
+            reqOrigin = new URL(c.req.url).origin;
+          } catch {
+            // ignore
+          }
+          if (
+            origin !== reqOrigin &&
+            resolveAllowedCorsOrigin(origin, c.env) === null
+          ) {
+            return c.json(
+              { error: 'Invalid Origin header for state-changing request (CSRF)' },
+              403,
+            );
+          }
+        }
+      }
+    }
+    return next();
+  });
+
   const getRepo = (env?: ApiBindings) =>
     resolveRepository(getEnvValue(env, 'DATABASE_URL'));
   const getAlbum = (env?: ApiBindings) =>
-    resolveAlbumStorage(getEnvValue(env, 'ALBUM_BUCKET'));
+    resolveAlbumStorage(getEnvValue(env, 'ALBUM_BUCKET'), {
+      accountId: getEnvValue(env, 'R2_ACCOUNT_ID'),
+      accessKeyId: getEnvValue(env, 'R2_ACCESS_KEY_ID'),
+      secretAccessKey: getEnvValue(env, 'R2_SECRET_ACCESS_KEY'),
+      bucketName: getEnvValue(env, 'R2_BUCKET_NAME'),
+    });
 
   const resolveCurrentUser = async (
     c: Context<{ Bindings: ApiBindings }>,
@@ -305,8 +434,6 @@ export function createApiApp() {
     const token = extractRequestToken(
       c.req.header('Authorization'),
       getCookie(c, SESSION_COOKIE_NAME),
-      getCookie(c, BETTER_AUTH_COOKIE_NAME) ??
-        getCookie(c, `__Secure-${BETTER_AUTH_COOKIE_NAME}`),
     );
     if (!token) return null;
     const user = await getRepo(c.env).getUserBySessionToken(token);
@@ -354,12 +481,13 @@ export function createApiApp() {
 
       // 2. 認証・ゲストセッション初期化・アカウント連携引き継ぎ
       .post('/auth/session', async (c) => {
+        if (!checkRateLimit('auth_session', getClientIp(c), 40, 60_000)) {
+          return c.json({ error: 'リクエストが多すぎます。しばらく待ってから再試行してください' }, 429);
+        }
         const repo = getRepo(c.env);
         const currentToken = extractRequestToken(
           c.req.header('Authorization'),
           getCookie(c, SESSION_COOKIE_NAME),
-          getCookie(c, BETTER_AUTH_COOKIE_NAME) ??
-            getCookie(c, `__Secure-${BETTER_AUTH_COOKIE_NAME}`),
         );
         const { user, sessionToken } =
           await repo.getOrCreateAnonymousUser(currentToken);
@@ -375,18 +503,19 @@ export function createApiApp() {
         zValidator(
           'json',
           z.object({
-            email: z.string().email(),
+            email: z.string().email().max(254),
             password: z.string().min(8).max(100),
             name: z.string().min(1).max(30),
           }),
         ),
         async (c) => {
+          if (!checkRateLimit('auth_write', getClientIp(c), 15, 60_000)) {
+            return c.json({ error: 'リクエストが多すぎます。しばらく待ってから再試行してください' }, 429);
+          }
           const repo = getRepo(c.env);
           const currentToken = extractRequestToken(
             c.req.header('Authorization'),
             getCookie(c, SESSION_COOKIE_NAME),
-            getCookie(c, BETTER_AUTH_COOKIE_NAME) ??
-              getCookie(c, `__Secure-${BETTER_AUTH_COOKIE_NAME}`),
           );
           const body = c.req.valid('json');
           try {
@@ -411,24 +540,32 @@ export function createApiApp() {
         zValidator(
           'json',
           z.object({
-            email: z.string().email(),
-            password: z.string().min(1),
+            email: z.string().email().max(254),
+            password: z.string().min(1).max(100),
           }),
         ),
         async (c) => {
+          if (!checkRateLimit('auth_write', getClientIp(c), 15, 60_000)) {
+            return c.json({ error: 'リクエストが多すぎます。しばらく待ってから再試行してください' }, 429);
+          }
           const repo = getRepo(c.env);
           const currentToken = extractRequestToken(
             c.req.header('Authorization'),
             getCookie(c, SESSION_COOKIE_NAME),
-            getCookie(c, BETTER_AUTH_COOKIE_NAME) ??
-              getCookie(c, `__Secure-${BETTER_AUTH_COOKIE_NAME}`),
           );
           const body = c.req.valid('json');
           try {
-            const { user, sessionToken } = await repo.signInWithEmail({
-              currentSessionToken: currentToken,
-              ...body,
-            });
+            const { user, sessionToken, r2KeysToDelete } =
+              await repo.signInWithEmail({
+                currentSessionToken: currentToken,
+                ...body,
+              });
+            if (r2KeysToDelete && r2KeysToDelete.length > 0) {
+              const album = getAlbum(c.env);
+              for (const key of r2KeysToDelete) {
+                await album.deletePhoto(key).catch(() => {});
+              }
+            }
             setCookie(c, SESSION_COOKIE_NAME, sessionToken, sessionCookieOptions(c));
             const visits = await repo.getUserVisits(user.id);
             return c.json({ user, sessionToken, visits });
@@ -446,8 +583,6 @@ export function createApiApp() {
         const token = extractRequestToken(
           c.req.header('Authorization'),
           getCookie(c, SESSION_COOKIE_NAME),
-          getCookie(c, BETTER_AUTH_COOKIE_NAME) ??
-            getCookie(c, `__Secure-${BETTER_AUTH_COOKIE_NAME}`),
         );
         if (token) await repo.signOutSession(token);
         deleteCookie(c, SESSION_COOKIE_NAME, { path: '/' });
@@ -457,6 +592,9 @@ export function createApiApp() {
 
       // OAuth ソーシャルログイン開始（現在のゲストトークンを一時保管してから Better Auth 認可URLへリダイレクト）
       .get('/auth/oauth-start/:provider', async (c) => {
+        if (c.req.header('Sec-Fetch-Site') === 'cross-site') {
+          return c.json({ error: 'Cross-site OAuth initiation forbidden' }, 403);
+        }
         const provider = c.req.param('provider');
         if (provider !== 'twitter' && provider !== 'google' && provider !== 'apple') {
           return c.json({ error: 'Unsupported OAuth provider' }, 400);
@@ -709,6 +847,9 @@ export function createApiApp() {
       })
 
       .get('/spots/:id/bearing', async (c) => {
+        if (!checkRateLimit('bearing', getClientIp(c), 180, 60_000)) {
+          return c.json({ error: 'リクエストが多すぎます' }, 429);
+        }
         const lat = Number(c.req.query('lat'));
         const lng = Number(c.req.query('lng'));
         if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
@@ -718,7 +859,8 @@ export function createApiApp() {
         if (!spot) return c.json({ error: 'Spot not found' }, 404);
         return c.json({
           distanceMeters: haversineDistanceMeters(lat, lng, spot.lat, spot.lng),
-          bearingDeg: calculateBearingDeg(lat, lng, spot.lat, spot.lng),
+          bearingDeg:
+            Math.round(calculateBearingDeg(lat, lng, spot.lat, spot.lng)) % 360,
           arrivalRadiusMeters: spot.arrivalRadiusMeters,
         });
       })
@@ -739,12 +881,13 @@ export function createApiApp() {
         '/spots/:id/unlock',
         zValidator('json', UnlockRequestSchema),
         async (c) => {
+          if (!checkRateLimit('unlock', getClientIp(c), 60, 60_000)) {
+            return c.json({ error: 'リクエストが多すぎます' }, 429);
+          }
           const repo = getRepo(c.env);
           const currentToken = extractRequestToken(
             c.req.header('Authorization'),
             getCookie(c, SESSION_COOKIE_NAME),
-            getCookie(c, BETTER_AUTH_COOKIE_NAME) ??
-              getCookie(c, `__Secure-${BETTER_AUTH_COOKIE_NAME}`),
           );
           const { user, sessionToken } =
             await repo.getOrCreateAnonymousUser(currentToken);
@@ -798,7 +941,9 @@ export function createApiApp() {
               userId: user.id,
               spotId,
               status: 'visited',
-              selfDiscovered: body.mapMode === 'treasure',
+              selfDiscovered:
+                body.mapMode === 'treasure' &&
+                user.settings.mapMode === 'treasure',
             });
           } else if (body.mode === 'give_up') {
             visit = await repo.recordVisit({
@@ -833,9 +978,13 @@ export function createApiApp() {
         async (c) => {
           const auth = await resolveCurrentUser(c);
           if (!auth) return c.json({ error: 'Unauthorized' }, 401);
+          const spotId = c.req.param('spotId');
+          if (!SAFE_SPOT_ID_REGEX.test(spotId)) {
+            return c.json({ error: 'Invalid spotId' }, 400);
+          }
           const updated = await getRepo(c.env).updateVisitAlbum({
             userId: auth.user.id,
-            spotId: c.req.param('spotId'),
+            spotId,
             privateMemo: c.req.valid('json').privateMemo,
           });
           if (!updated) return c.json({ error: '訪問記録が見つかりません' }, 404);
@@ -845,25 +994,38 @@ export function createApiApp() {
 
       .put(
         '/me/visits/:spotId/photo',
-        zValidator('json', z.object({ dataUrl: z.string().min(20) })),
+        zValidator('json', z.object({ dataUrl: z.string().min(20).max(8_000_000) })),
         async (c) => {
+          if (!checkRateLimit('photo_upload', getClientIp(c), 20, 60_000)) {
+            return c.json({ error: 'リクエストが多すぎます' }, 429);
+          }
           const auth = await resolveCurrentUser(c);
           if (!auth) return c.json({ error: 'Unauthorized' }, 401);
 
           const spotId = c.req.param('spotId');
+          if (!SAFE_SPOT_ID_REGEX.test(spotId)) {
+            return c.json({ error: '不正なスポットIDです' }, 400);
+          }
           try {
+            const repo = getRepo(c.env);
+            // R2 への先行書き込みによる孤立オブジェクト生成（Storage DoS）を防ぐため、
+            // 必ず事前にユーザーの訪問レコードが存在するか確認する
+            const userVisits = await repo.getUserVisits(auth.user.id);
+            if (!userVisits[spotId]) {
+              return c.json({ error: '訪問記録が見つかりません' }, 404);
+            }
+
             const { bytes, mime } = decodeDataUrlToBytes(
               c.req.valid('json').dataUrl,
             );
-            const ext = mime.includes('png')
+            const ext = mime === 'image/png'
               ? 'png'
-              : mime.includes('webp')
+              : mime === 'image/webp'
                 ? 'webp'
                 : 'jpg';
             const r2Key = `albums/${auth.user.id}/${spotId}_${Date.now()}.${ext}`;
 
             const albumStorage = getAlbum(c.env);
-            const repo = getRepo(c.env);
 
             // 既存の古い画像があればR2から削除
             const oldMeta = await repo.getVisitPhotoMeta(auth.user.id, spotId);
@@ -879,6 +1041,7 @@ export function createApiApp() {
               privatePhotoMime: mime,
             });
             if (!updated) {
+              await albumStorage.deletePhoto(r2Key).catch(() => {});
               return c.json({ error: '訪問記録が見つかりません' }, 404);
             }
             return c.json({ visit: updated });
@@ -895,19 +1058,40 @@ export function createApiApp() {
         const auth = await resolveCurrentUser(c);
         if (!auth) return c.json({ error: 'Unauthorized' }, 401);
 
+        const spotId = c.req.param('spotId');
+        if (!SAFE_SPOT_ID_REGEX.test(spotId)) {
+          return c.json({ error: 'Invalid spotId' }, 400);
+        }
+
         const meta = await getRepo(c.env).getVisitPhotoMeta(
           auth.user.id,
-          c.req.param('spotId'),
+          spotId,
         );
         if (!meta) return c.json({ error: 'Photo not found' }, 404);
 
         const stored = await getAlbum(c.env).getPhoto(meta.r2Key);
         if (!stored) return c.json({ error: 'Photo blob missing' }, 404);
 
+        const safeMime =
+          stored.contentType === 'image/png' ||
+          stored.contentType === 'image/webp' ||
+          stored.contentType === 'image/jpeg'
+            ? stored.contentType
+            : 'image/jpeg';
+        const ext =
+          safeMime === 'image/png'
+            ? 'png'
+            : safeMime === 'image/webp'
+              ? 'webp'
+              : 'jpg';
+
         return new Response(stored.bytes as BodyInit, {
           status: 200,
           headers: {
-            'Content-Type': stored.contentType,
+            'Content-Type': safeMime,
+            'Content-Disposition': `inline; filename="visit-photo.${ext}"`,
+            'X-Content-Type-Options': 'nosniff',
+            'Content-Security-Policy': "default-src 'none'; sandbox",
             'Cache-Control': 'private, max-age=3600',
           },
         });
@@ -915,6 +1099,14 @@ export function createApiApp() {
 
       // 6. 場所検索・URL座標解析・重複検知・聖地登録
       .get('/spots/duplicates', async (c) => {
+        if (!checkRateLimit('duplicates', getClientIp(c), 40, 60_000)) {
+          return c.json({ error: 'リクエストが多すぎます' }, 429);
+        }
+        // 未解禁スポットの正式名称が未認証スクレイピングされるのを防ぐため、ログイン済みユーザー限定
+        const auth = await resolveCurrentUser(c);
+        if (!auth || auth.user.isAnonymous) {
+          return c.json({ error: 'ログインが必要です' }, 401);
+        }
         const lat = Number(c.req.query('lat'));
         const lng = Number(c.req.query('lng'));
         if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
@@ -936,10 +1128,35 @@ export function createApiApp() {
 
       .post(
         '/locations/resolve',
-        zValidator('json', z.object({ input: z.string().min(1) })),
+        zValidator('json', z.object({ input: z.string().min(1).max(500) })),
         async (c) => {
+          if (!checkRateLimit('geocoder', getClientIp(c), 30, 60_000)) {
+            return c.json({ error: 'リクエストが多すぎます' }, 429);
+          }
+          const rawInput = c.req.valid('json').input.trim();
+          // 既に完全なGoogleマップURLで座標(!3d!4d等)がローカル正規表現のみで抽出できる場合は外部API課金が発生しないため即時返却
+          const isShortUrl =
+            /https:\/\/(?:maps\.app\.goo\.gl|goo\.gl\/maps)\/[a-zA-Z0-9_-]+/.test(
+              rawInput,
+            );
+          if (!isShortUrl) {
+            const localParsed = parseGoogleMapsUrl(rawInput);
+            if (localParsed.lat !== undefined && localParsed.lng !== undefined) {
+              return c.json(localParsed);
+            }
+          }
+
+          // 短縮URLのネットワーク展開やGoogle Places API / 国土地理院フォールバック検索を伴う場合はログイン済みユーザー限定（Denial of Wallet 防止）
+          const auth = await resolveCurrentUser(c);
+          if (!auth || auth.user.isAnonymous) {
+            return c.json(
+              { error: '場所名検索・短縮URL展開にはログインが必要です' },
+              401,
+            );
+          }
+
           const result = await resolveLocationInput(
-            c.req.valid('json').input,
+            rawInput,
             getEnvValue(c.env, 'GOOGLE_MAPS_API_KEY'),
           );
           return c.json(result);
@@ -947,7 +1164,18 @@ export function createApiApp() {
       )
 
       .get('/locations/search', async (c) => {
-        const q = c.req.query('q') ?? '';
+        if (!checkRateLimit('geocoder', getClientIp(c), 30, 60_000)) {
+          return c.json({ error: 'リクエストが多すぎます' }, 429);
+        }
+        // Google Places API 課金枯渇攻撃（Denial of Wallet）を防ぐためログイン済みユーザー限定
+        const auth = await resolveCurrentUser(c);
+        if (!auth || auth.user.isAnonymous) {
+          return c.json({ error: '施設・住所検索にはログインが必要です' }, 401);
+        }
+        const q = (c.req.query('q') ?? '').trim();
+        if (q.length > 120) {
+          return c.json({ error: '検索キーワードは120文字以内にしてください' }, 400);
+        }
         const candidates = await searchPlacesByQuery(
           q,
           getEnvValue(c.env, 'GOOGLE_MAPS_API_KEY'),
@@ -956,6 +1184,9 @@ export function createApiApp() {
       })
 
       .post('/spots', zValidator('json', CreateSpotInputSchema), async (c) => {
+        if (!checkRateLimit('create_spot', getClientIp(c), 20, 60_000)) {
+          return c.json({ error: 'リクエストが多すぎます' }, 429);
+        }
         const auth = await resolveCurrentUser(c);
         if (!auth || auth.user.isAnonymous) {
           return c.json(
@@ -986,18 +1217,22 @@ export function createApiApp() {
         zValidator(
           'json',
           z.object({
-            authorName: z.string().min(1).max(30),
+            authorName: z.string().min(1).max(30).optional(),
             content: z.string().min(1).max(300),
             isPublic: z.boolean().default(true),
           }),
         ),
         async (c) => {
+          if (!checkRateLimit('post_comment', getClientIp(c), 20, 60_000)) {
+            return c.json({ error: 'リクエストが多すぎます' }, 429);
+          }
           const auth = await resolveCurrentUser(c);
           if (!auth) return c.json({ error: 'Unauthorized' }, 401);
 
           const spotId = c.req.param('id');
           const userVisits = await getRepo(c.env).getUserVisits(auth.user.id);
-          if (!userVisits[spotId] && auth.user.role !== 'admin') {
+          const visit = userVisits[spotId];
+          if (!visit && auth.user.role !== 'admin') {
             return c.json(
               { error: '解禁済みの聖地にのみコメントを投稿できます' },
               403,
@@ -1005,10 +1240,31 @@ export function createApiApp() {
           }
 
           const body = c.req.valid('json');
+          // ギブアップ解禁（現地未訪問）のユーザーは公開コメント不可（自分用非公開ノートのみ許可）
+          if (
+            body.isPublic &&
+            visit?.status !== 'visited' &&
+            auth.user.role !== 'admin'
+          ) {
+            return c.json(
+              {
+                error:
+                  '他の巡礼者への公開コメントは、現地に到着して発見達成した聖地にのみ投稿できます（自分のみ表示のメモは保存可能です）',
+              },
+              403,
+            );
+          }
+
+          // 投稿者名のなりすましを防ぐため、サーバー側の認証ユーザー表示名を強制使用
+          const verifiedAuthorName =
+            auth.user.settings.nickname?.trim() ||
+            auth.user.name?.trim() ||
+            'おひさま探索者';
+
           const saved = await getRepo(c.env).addComment({
             spotId,
             userId: auth.user.id,
-            authorName: body.authorName,
+            authorName: verifiedAuthorName,
             content: body.content,
             isPublic: body.isPublic,
           });
@@ -1026,6 +1282,9 @@ export function createApiApp() {
           }),
         ),
         async (c) => {
+          if (!checkRateLimit('post_report', getClientIp(c), 15, 60_000)) {
+            return c.json({ error: 'リクエストが多すぎます' }, 429);
+          }
           const auth = await resolveCurrentUser(c);
           if (!auth) return c.json({ error: 'Unauthorized' }, 401);
           const body = c.req.valid('json');
@@ -1039,7 +1298,7 @@ export function createApiApp() {
         },
       )
 
-      // 8. 管理者機能（一括インポート・マイマップURL同期・通報審査・スポット編集削除）
+      // 8. 管理者機能（一括インポート・マイマップURL同期・通報審査・スポット/エピソード/コメント編集削除）
       .get('/admin/reports', async (c) => {
         const auth = await resolveCurrentUser(c);
         if (!auth || auth.user.role !== 'admin') {
@@ -1108,13 +1367,50 @@ export function createApiApp() {
         return c.json({ deleted });
       })
 
+      .delete('/admin/spots/:spotId/episodes/:episodeId', async (c) => {
+        const auth = await resolveCurrentUser(c);
+        if (!auth || auth.user.role !== 'admin') {
+          return c.json({ error: '管理者権限が必要です' }, 403);
+        }
+        try {
+          const updatedSpot = await getRepo(c.env).deleteEpisode(
+            c.req.param('spotId'),
+            c.req.param('episodeId'),
+          );
+          if (!updatedSpot) {
+            return c.json({ error: '対象スポットまたはエピソードが見つかりません' }, 404);
+          }
+          return c.json({ spot: updatedSpot });
+        } catch (err) {
+          return c.json(
+            { error: err instanceof Error ? err.message : 'エピソード削除に失敗しました' },
+            400,
+          );
+        }
+      })
+
+      .delete('/admin/spots/:spotId/comments/:commentId', async (c) => {
+        const auth = await resolveCurrentUser(c);
+        if (!auth || auth.user.role !== 'admin') {
+          return c.json({ error: '管理者権限が必要です' }, 403);
+        }
+        const deleted = await getRepo(c.env).deleteComment(
+          c.req.param('spotId'),
+          c.req.param('commentId'),
+        );
+        if (!deleted) {
+          return c.json({ error: 'コメントが見つかりません' }, 404);
+        }
+        return c.json({ deleted: true });
+      })
+
       .post(
         '/admin/import',
         zValidator(
           'json',
           z.object({
             format: z.enum(['kml', 'csv', 'mymap_url']),
-            content: z.string().min(1),
+            content: z.string().min(1).max(10_000_000),
           }),
         ),
         async (c) => {
@@ -1136,7 +1432,9 @@ export function createApiApp() {
               );
             }
             const kmlUrl = `https://www.google.com/maps/d/kml?mid=${mid}&forcekml=1`;
-            const kmlRes = await fetch(kmlUrl);
+            const kmlRes = await fetch(kmlUrl, {
+              signal: AbortSignal.timeout(8000),
+            });
             if (!kmlRes.ok) {
               return c.json(
                 { error: 'GoogleマイマップからKMLを取得できませんでした（公開設定をご確認ください）' },
@@ -1144,6 +1442,9 @@ export function createApiApp() {
               );
             }
             const kmlXml = await kmlRes.text();
+            if (kmlXml.length > 15_000_000) {
+              return c.json({ error: 'KMLファイルサイズが上限（15MB）を超えています' }, 400);
+            }
             candidates = parseKmlToCandidates(kmlXml);
           } else if (format === 'kml') {
             candidates = parseKmlToCandidates(content);

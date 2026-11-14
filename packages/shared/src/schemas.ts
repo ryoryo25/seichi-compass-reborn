@@ -194,7 +194,10 @@ export const ApiMetaResponseSchema = z.object({
 export type ApiMetaResponse = z.infer<typeof ApiMetaResponseSchema>;
 
 export const CreateSpotInputSchema = z.object({
-  existingSpotId: z.string().optional(),
+  existingSpotId: z
+    .string()
+    .regex(/^[a-zA-Z0-9_-]{1,80}$/)
+    .optional(),
   title: z.string().min(1).max(120),
   lat: z.number().min(-90).max(90),
   lng: z.number().min(-180).max(180),
@@ -202,8 +205,8 @@ export const CreateSpotInputSchema = z.object({
   mediaCategory: MediaCategorySchema,
   description: z.string().min(1).max(1000),
   referenceUrl: z.string().max(500).optional().or(z.literal('')),
-  members: z.array(z.string()).default([]),
-  hashtags: z.array(z.string()).default([]),
+  members: z.array(z.string().min(1).max(40)).max(35).default([]),
+  hashtags: z.array(z.string().min(1).max(40)).max(20).default([]),
 });
 export type CreateSpotInput = z.infer<typeof CreateSpotInputSchema>;
 

@@ -45,7 +45,11 @@ export interface SeichiRepository {
     currentSessionToken?: string;
     email: string;
     password: string;
-  }): Promise<{ user: AuthUser; sessionToken: string }>;
+  }): Promise<{
+    user: AuthUser;
+    sessionToken: string;
+    r2KeysToDelete?: string[];
+  }>;
   signOutSession(token: string): Promise<void>;
   issueSessionForUser(userId: string): Promise<{
     user: AuthUser;
@@ -87,6 +91,8 @@ export interface SeichiRepository {
     deleted: boolean;
     r2KeysToDelete: string[];
   }>;
+  deleteEpisode(spotId: string, episodeId: string): Promise<Spot | null>;
+  deleteComment(spotId: string, commentId: string): Promise<boolean>;
   bulkImportCandidates(
     candidates: RawCandidateEpisode[],
     createdByUserId: string,

@@ -161,16 +161,25 @@ export function validateAndParseReferenceUrl(
     return { ok: false, reason: 'セキュリティ保護のため https:// のURLのみ登録可能です' };
   }
 
+  if (url.username || url.password) {
+    return { ok: false, reason: '認証情報を含むURLは登録できません' };
+  }
+
   const host = url.hostname.toLowerCase();
-  // SSRF / プライベートネットワーク遮断
+  // SSRF / プライベートネットワーク / IPリテラル（IPv4・IPv6・射影IPv6・整数IP）遮断
   if (
     host === 'localhost' ||
     host.endsWith('.local') ||
+    host.endsWith('.internal') ||
+    host.startsWith('[') ||
+    host.includes(':') ||
+    !host.includes('.') ||
+    /^\d+(\.\d+)*$/.test(host) ||
+    /^0x/i.test(host) ||
     /^(127\.|10\.|192\.168\.|169\.254\.|0\.)/.test(host) ||
-    /^172\.(1[6-9]|2\d|3[0-1])\./.test(host) ||
-    host === '[::1]'
+    /^172\.(1[6-9]|2\d|3[0-1])\./.test(host)
   ) {
-    return { ok: false, reason: '内部ネットワーク宛てのURLは登録できません' };
+    return { ok: false, reason: '内部ネットワークまたはIP直指定のURLは登録できません' };
   }
 
   // YouTube 判定 & 動画ID + 秒数抽出

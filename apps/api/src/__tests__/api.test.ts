@@ -337,6 +337,148 @@ describe('@seichi/api Hono RPC 統合テスト', () => {
     );
     assert.equal(ownerPhotoRes.status, 200);
     assert.equal(ownerPhotoRes.headers.get('Content-Type'), 'image/png');
+    assert.equal(ownerPhotoRes.headers.get('X-Content-Type-Options'), 'nosniff');
+    assert.equal(
+      ownerPhotoRes.headers.get('Content-Security-Policy'),
+      "default-src 'none'; sandbox",
+    );
+
+    // 6b. SVG (Stored XSS) および偽装マジックバイト画像の拒否・未訪問スポットへのR2先行書き込み防止 (C-1)
+    const svgDataUrl =
+      'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciPjxzY3JpcHQ+YWxlcnQoMSk8L3NjcmlwdD48L3N2Zz4=';
+    const svgUploadRes = await apiApp.request(
+      'https://seichi.example/api/me/visits/spot_gme98q_0/photo',
+      {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${signupData.sessionToken}`,
+        },
+        body: JSON.stringify({ dataUrl: svgDataUrl }),
+      },
+      env,
+    );
+    assert.equal(svgUploadRes.status, 400);
+
+    const fakePngDataUrl = 'data:image/png;base64,dGVzdC1ub3QtYS1wbmctZmlsZQ==';
+    const fakeMagicRes = await apiApp.request(
+      'https://seichi.example/api/me/visits/spot_gme98q_0/photo',
+      {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${signupData.sessionToken}`,
+        },
+        body: JSON.stringify({ dataUrl: fakePngDataUrl }),
+      },
+      env,
+    );
+    assert.equal(fakeMagicRes.status, 400);
+
+    // 未訪問スポットに対する写真アップロードは R2 へ一切書き込まずに 404 を返すこと
+    const keysBeforeUnvisited = bucket.keys().length;
+    const unvisitedPhotoRes = await apiApp.request(
+      'https://seichi.example/api/me/visits/unvisited_spot_999/photo',
+      {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${signupData.sessionToken}`,
+        },
+        body: JSON.stringify({ dataUrl: TINY_PNG_DATA_URL }),
+      },
+      env,
+    );
+    assert.equal(unvisitedPhotoRes.status, 404);
+    assert.equal(bucket.keys().length, keysBeforeUnvisited);
+
+    // 6c. 未認証/ゲストによる課金検索API・重複照会APIの遮断 (C-3 / M-1) および CSRF 防御 (H-3)
+    const anonSearchRes = await apiApp.request(
+      'https://seichi.example/api/locations/search?q=渋谷駅',
+      {},
+      env,
+    );
+    assert.equal(anonSearchRes.status, 401);
+
+    const anonDupRes = await apiApp.request(
+      'https://seichi.example/api/spots/duplicates?lat=35.6626&lng=139.7038',
+      {},
+      env,
+    );
+    assert.equal(anonDupRes.status, 401);
+
+    const csrfSignoutRes = await apiApp.request(
+      'https://seichi.example/api/auth/signout',
+      {
+        method: 'POST',
+        headers: {
+          Origin: 'https://evil.example',
+          Cookie: `seichi_session=${signupData.sessionToken}`,
+        },
+      },
+      env,
+    );
+    assert.equal(csrfSignoutRes.status, 403);
+
+    // 6d. ギブアップ解禁時は公開コメント不可 & 投稿者名のサーバー側強制 (M-2)
+    await apiApp.request(
+      'https://seichi.example/api/spots/spot_gme98q_0/unlock',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${otherSession.sessionToken}`,
+        },
+        body: JSON.stringify({
+          userLat: 35.0,
+          userLng: 135.0,
+          mode: 'give_up',
+          mapMode: 'treasure',
+        }),
+      },
+      env,
+    );
+    const giveUpPublicCommentRes = await apiApp.request(
+      'https://seichi.example/api/spots/spot_gme98q_0/comments',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${otherSession.sessionToken}`,
+        },
+        body: JSON.stringify({
+          authorName: 'なりすまし運営',
+          content: '現地に行かずに公開スパム',
+          isPublic: true,
+        }),
+      },
+      env,
+    );
+    assert.equal(giveUpPublicCommentRes.status, 403);
+
+    const visitedCommentRes = await apiApp.request(
+      'https://seichi.example/api/spots/spot_gme98q_0/comments',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${signupData.sessionToken}`,
+        },
+        body: JSON.stringify({
+          authorName: '偽装ニックネーム',
+          content: '現地到着済みユーザーのコメント',
+          isPublic: true,
+        }),
+      },
+      env,
+    );
+    assert.equal(visitedCommentRes.status, 200);
+    const postedComment = (
+      (await visitedCommentRes.json()) as {
+        comment: { id: string; authorName: string };
+      }
+    ).comment;
+    assert.equal(postedComment.authorName, 'テストおひさま');
 
     // 7. テスト用スポット新規作成 -> 訪問&写真保存 -> Admin削除でR2オブジェクトも連動削除されること
     const createSpotRes = await apiApp.request(

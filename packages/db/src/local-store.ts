@@ -170,6 +170,161 @@ export class CloudflareR2AlbumStorage implements PrivateAlbumStorage {
   }
 }
 
+export interface R2S3Config {
+  accountId: string;
+  accessKeyId: string;
+  secretAccessKey: string;
+  bucketName: string;
+}
+
+function bytesToHex(bytes: Uint8Array): string {
+  return Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+async function sha256Hex(data: Uint8Array | string): Promise<string> {
+  const bytes =
+    typeof data === 'string' ? new TextEncoder().encode(data) : data;
+  const hash = await crypto.subtle.digest('SHA-256', bytes as BufferSource);
+  return bytesToHex(new Uint8Array(hash));
+}
+
+async function hmacSha256(
+  key: Uint8Array | string,
+  message: string,
+): Promise<Uint8Array> {
+  const keyBytes =
+    typeof key === 'string' ? new TextEncoder().encode(key) : key;
+  const cryptoKey = await crypto.subtle.importKey(
+    'raw',
+    keyBytes as BufferSource,
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  );
+  const sig = await crypto.subtle.sign(
+    'HMAC',
+    cryptoKey,
+    new TextEncoder().encode(message),
+  );
+  return new Uint8Array(sig);
+}
+
+/**
+ * Vercel / Node.js 環境から Cloudflare R2 S3互換APIへ接続するストレージ実装（AWS SigV4 署名・外部SDK依存なし）
+ */
+export class CloudflareR2S3AlbumStorage implements PrivateAlbumStorage {
+  private readonly cfg: R2S3Config;
+
+  constructor(cfg: R2S3Config) {
+    this.cfg = cfg;
+  }
+
+  private async signedFetch(
+    method: 'PUT' | 'GET' | 'DELETE',
+    objectKey: string,
+    body?: Uint8Array,
+    contentType?: string,
+  ): Promise<Response> {
+    const host = `${this.cfg.accountId}.r2.cloudflarestorage.com`;
+    const encodedKey = objectKey
+      .split('/')
+      .map((seg) => encodeURIComponent(seg))
+      .join('/');
+    const canonicalUri = `/${encodeURIComponent(this.cfg.bucketName)}/${encodedKey}`;
+    const url = `https://${host}${canonicalUri}`;
+
+    const now = new Date();
+    const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, '');
+    const dateStamp = amzDate.slice(0, 8);
+    const region = 'auto';
+    const service = 's3';
+
+    const payloadHash = await sha256Hex(body ?? '');
+    const headersRecord: Record<string, string> = {
+      host,
+      'x-amz-content-sha256': payloadHash,
+      'x-amz-date': amzDate,
+    };
+    if (contentType) {
+      headersRecord['content-type'] = contentType;
+    }
+
+    const sortedHeaderKeys = Object.keys(headersRecord).sort();
+    const canonicalHeaders = sortedHeaderKeys
+      .map((k) => `${k}:${headersRecord[k]}\n`)
+      .join('');
+    const signedHeaders = sortedHeaderKeys.join(';');
+
+    const canonicalRequest = [
+      method,
+      canonicalUri,
+      '',
+      canonicalHeaders,
+      signedHeaders,
+      payloadHash,
+    ].join('\n');
+
+    const credentialScope = `${dateStamp}/${region}/${service}/aws4_request`;
+    const stringToSign = [
+      'AWS4-HMAC-SHA256',
+      amzDate,
+      credentialScope,
+      await sha256Hex(canonicalRequest),
+    ].join('\n');
+
+    const kDate = await hmacSha256(
+      `AWS4${this.cfg.secretAccessKey}`,
+      dateStamp,
+    );
+    const kRegion = await hmacSha256(kDate, region);
+    const kService = await hmacSha256(kRegion, service);
+    const kSigning = await hmacSha256(kService, 'aws4_request');
+    const signature = bytesToHex(await hmacSha256(kSigning, stringToSign));
+
+    const authorization = `AWS4-HMAC-SHA256 Credential=${this.cfg.accessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
+
+    return fetch(url, {
+      method,
+      headers: {
+        ...headersRecord,
+        Authorization: authorization,
+      },
+      body: body ? (body as BodyInit) : undefined,
+      signal: AbortSignal.timeout(10000),
+    });
+  }
+
+  public async putPhoto(
+    key: string,
+    bytes: Uint8Array,
+    contentType: string,
+  ): Promise<void> {
+    const res = await this.signedFetch('PUT', key, bytes, contentType);
+    if (!res.ok) {
+      throw new Error(`R2 S3 PUT failed with status ${res.status}`);
+    }
+  }
+
+  public async getPhoto(key: string): Promise<StoredPhotoObject | null> {
+    const res = await this.signedFetch('GET', key);
+    if (res.status === 404) return null;
+    if (!res.ok) {
+      throw new Error(`R2 S3 GET failed with status ${res.status}`);
+    }
+    const ab = await res.arrayBuffer();
+    return {
+      bytes: new Uint8Array(ab),
+      contentType: res.headers.get('content-type') ?? 'image/jpeg',
+    };
+  }
+
+  public async deletePhoto(key: string): Promise<void> {
+    await this.signedFetch('DELETE', key).catch(() => {});
+  }
+}
+
 export class LocalPersistenceRepository implements SeichiRepository {
   private spots: Spot[] | null = null;
   private state: LocalAppState | null = null;
@@ -310,6 +465,9 @@ export class LocalPersistenceRepository implements SeichiRepository {
     for (const c of this.state!.comments) {
       if (c.userId === fromGuestUserId) c.userId = toUserId;
     }
+    for (const r of this.state!.reports) {
+      if (r.reporterUserId === fromGuestUserId) r.reporterUserId = toUserId;
+    }
     this.persistState();
     return { r2KeysToDelete };
   }
@@ -375,7 +533,11 @@ export class LocalPersistenceRepository implements SeichiRepository {
     currentSessionToken?: string;
     email: string;
     password: string;
-  }): Promise<{ user: AuthUser; sessionToken: string }> {
+  }): Promise<{
+    user: AuthUser;
+    sessionToken: string;
+    r2KeysToDelete?: string[];
+  }> {
     this.ensureLoaded();
     const normalizedEmail = params.email.trim().toLowerCase();
     const target = Object.values(this.state!.users).find(
@@ -389,11 +551,13 @@ export class LocalPersistenceRepository implements SeichiRepository {
       throw new Error('メールアドレスまたはパスワードが正しくありません');
     }
 
+    let r2KeysToDelete: string[] = [];
     const currentGuest = params.currentSessionToken
       ? await this.getUserBySessionToken(params.currentSessionToken)
       : null;
     if (currentGuest && currentGuest.isAnonymous && currentGuest.id !== target.id) {
-      await this.mergeAnonymousUserData(currentGuest.id, target.id);
+      const merged = await this.mergeAnonymousUserData(currentGuest.id, target.id);
+      r2KeysToDelete = merged.r2KeysToDelete;
     }
 
     const token = `tok_${crypto.randomUUID()}${crypto.randomUUID().replace(/-/g, '')}`;
@@ -402,7 +566,7 @@ export class LocalPersistenceRepository implements SeichiRepository {
       expiresAt: Date.now() + 1000 * 60 * 60 * 24 * 90,
     };
     this.persistState();
-    return { user: this.sanitizeUser(target), sessionToken: token };
+    return { user: this.sanitizeUser(target), sessionToken: token, r2KeysToDelete };
   }
 
   public async signOutSession(token: string): Promise<void> {
@@ -699,6 +863,38 @@ export class LocalPersistenceRepository implements SeichiRepository {
     return { deleted: true, r2KeysToDelete };
   }
 
+  public async deleteEpisode(
+    spotId: string,
+    episodeId: string,
+  ): Promise<Spot | null> {
+    this.ensureLoaded();
+    const target = this.spots!.find((s) => s.id === spotId);
+    if (!target) return null;
+    if (!target.episodes.some((e) => e.id === episodeId)) return null;
+    if (target.episodes.length <= 1) {
+      throw new Error(
+        '最後の1エピソードは個別削除できません（スポット自体を削除するか編集してください）',
+      );
+    }
+    target.episodes = target.episodes.filter((e) => e.id !== episodeId);
+    this.persistSpots();
+    return target;
+  }
+
+  public async deleteComment(
+    spotId: string,
+    commentId: string,
+  ): Promise<boolean> {
+    this.ensureLoaded();
+    const before = this.state!.comments.length;
+    this.state!.comments = this.state!.comments.filter(
+      (c) => !(c.spotId === spotId && c.id === commentId),
+    );
+    if (this.state!.comments.length === before) return false;
+    this.persistState();
+    return true;
+  }
+
   public async bulkImportCandidates(
     candidates: RawCandidateEpisode[],
   ) {
@@ -912,21 +1108,71 @@ export class LocalPersistenceRepository implements SeichiRepository {
 let singletonLocalRepo: LocalPersistenceRepository | null = null;
 let singletonLocalAlbum: LocalFsAlbumStorage | null = null;
 
+function isLiveProductionRuntime(): boolean {
+  if (typeof process === 'undefined' || !process.env) return false;
+  if (process.env.NEXT_PHASE === 'phase-production-build') return false;
+  return (
+    process.env.NODE_ENV === 'production' &&
+    (process.env.VERCEL === '1' ||
+      process.env.CF_PAGES === '1' ||
+      process.env.REQUIRE_PROD_STORAGE === 'true')
+  );
+}
+
 /**
  * DATABASE_URL が設定されていれば本番 Neon PostGIS リポジトリ、未設定ならローカル永続リポジトリを返す
+ * 本番クラウド環境（Vercel / Cloudflare 等）で DATABASE_URL が未設定の場合はフェイルクローズで例外を送出する
  */
 export function resolveRepository(databaseUrl?: string): SeichiRepository {
   if (databaseUrl && databaseUrl.trim().startsWith('postgres')) {
     return new NeonPostgisRepository(databaseUrl.trim());
   }
+  if (isLiveProductionRuntime()) {
+    throw new Error(
+      '本番環境では DATABASE_URL (Neon PostgreSQL) の設定が必須です（ローカルFSへのフォールバックは禁止されています）',
+    );
+  }
   singletonLocalRepo ??= new LocalPersistenceRepository();
   return singletonLocalRepo;
 }
 
-export function resolveAlbumStorage(r2Bucket?: R2LikeBucket): PrivateAlbumStorage {
+export function resolveAlbumStorage(
+  r2Bucket?: R2LikeBucket,
+  r2S3Config?: Partial<R2S3Config>,
+): PrivateAlbumStorage {
   if (r2Bucket) {
     return new CloudflareR2AlbumStorage(r2Bucket);
   }
+  const accountId =
+    r2S3Config?.accountId ??
+    (typeof process !== 'undefined' ? process.env?.R2_ACCOUNT_ID : undefined);
+  const accessKeyId =
+    r2S3Config?.accessKeyId ??
+    (typeof process !== 'undefined' ? process.env?.R2_ACCESS_KEY_ID : undefined);
+  const secretAccessKey =
+    r2S3Config?.secretAccessKey ??
+    (typeof process !== 'undefined'
+      ? process.env?.R2_SECRET_ACCESS_KEY
+      : undefined);
+  const bucketName =
+    r2S3Config?.bucketName ??
+    (typeof process !== 'undefined' ? process.env?.R2_BUCKET_NAME : undefined);
+
+  if (accountId && accessKeyId && secretAccessKey && bucketName) {
+    return new CloudflareR2S3AlbumStorage({
+      accountId: accountId.trim(),
+      accessKeyId: accessKeyId.trim(),
+      secretAccessKey: secretAccessKey.trim(),
+      bucketName: bucketName.trim(),
+    });
+  }
+
+  if (isLiveProductionRuntime()) {
+    throw new Error(
+      '本番環境で非公開アルバム写真を使用するには Cloudflare R2 バインディング (ALBUM_BUCKET) または R2 S3 環境変数 (R2_ACCOUNT_ID / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY / R2_BUCKET_NAME) の設定が必要です',
+    );
+  }
+
   singletonLocalAlbum ??= new LocalFsAlbumStorage();
   return singletonLocalAlbum;
 }

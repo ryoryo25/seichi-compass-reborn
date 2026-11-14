@@ -55,6 +55,7 @@ DATABASE_URL="コピーしたNeon接続URL" npm run db:seed
 | 環境変数名 | 説明 |
 | :--- | :--- |
 | `ALLOWED_ORIGINS` | カンマ区切りの追加許可オリジン（Web と API を別ドメインで運用する場合のみ指定） |
+| `R2_ACCOUNT_ID` / `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` / `R2_BUCKET_NAME` | **Vercel 等の Node.js 環境で必須**：Cloudflare R2 S3互換API経由で非公開アルバム写真を保存するための認証情報（Cloudflare Workers デプロイ時は `ALBUM_BUCKET` バインディングが自動利用されます） |
 | `GOOGLE_MAPS_API_KEY` | Google Places API (New) キー（未設定時は国土地理院 API へ自動フォールバック） |
 | `TWITTER_CLIENT_ID` / `TWITTER_CLIENT_SECRET` | X (Twitter) OAuth 2.0 ログインを有効化する場合に設定 |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | Google OAuth ログインを有効化する場合に設定 |
@@ -92,7 +93,7 @@ npx --workspace=@seichi/api wrangler secret put BETTER_AUTH_SECRET
 # 4. Cloudflare Workers へ API をデプロイ
 npm run deploy:api
 ```
-（※設定ファイルは [`apps/api/wrangler.jsonc`](../apps/api/wrangler.jsonc) に定義されています）
+（※設定ファイルは [`apps/api/wrangler.jsonc`](../apps/api/wrangler.jsonc) に定義されています。Web フロントエンドと Cloudflare Workers API を別オリジンで運用する場合は、`SameSite=Lax` Cookie を共有できるよう同一親ドメインのサブドメイン構成（例: `app.example.com` と `api.example.com`）で配置してください。）
 
 ---
 

@@ -98,8 +98,8 @@ export default function HomePage() {
     totalEpisodes: 0,
     prefectures: [],
     oauthProviders: { twitter: false, google: false, apple: false },
-    allowDevRoleSwitch: true,
-    enableDemoSimulator: true,
+    allowDevRoleSwitch: false,
+    enableDemoSimulator: false,
   });
 
   // 検索フィルタ

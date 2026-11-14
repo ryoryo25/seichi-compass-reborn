@@ -65,6 +65,10 @@ describe('parseGoogleMapsUrl & validateAndParseReferenceUrl', () => {
     assert.equal(validateAndParseReferenceUrl('http://example.com').ok, false);
     assert.equal(validateAndParseReferenceUrl('https://127.0.0.1/admin').ok, false);
     assert.equal(validateAndParseReferenceUrl('https://192.168.1.1/test').ok, false);
+    assert.equal(validateAndParseReferenceUrl('https://[::ffff:127.0.0.1]/').ok, false);
+    assert.equal(validateAndParseReferenceUrl('https://[::ffff:169.254.169.254]/').ok, false);
+    assert.equal(validateAndParseReferenceUrl('https://[fc00::1]/').ok, false);
+    assert.equal(validateAndParseReferenceUrl('https://2130706433/').ok, false);
 
     const yt = validateAndParseReferenceUrl('https://youtu.be/7njC5lgL61c?t=2m22s');
     assert.equal(yt.ok, true);

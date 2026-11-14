@@ -216,6 +216,11 @@ export class NeonPostgisRepository implements SeichiRepository {
       .set({ userId: toUserId })
       .where(eq(spotComments.userId, fromGuestUserId));
 
+    await this.db
+      .update(spotReports)
+      .set({ reporterUserId: toUserId })
+      .where(eq(spotReports.reporterUserId, fromGuestUserId));
+
     // 不要になった匿名ゲストユーザー行を削除（sessions 等も cascade 削除）
     await this.db
       .delete(users)
@@ -262,13 +267,29 @@ export class NeonPostgisRepository implements SeichiRepository {
         .where(eq(users.id, currentGuest.id))
         .returning();
 
-      await this.db.insert(accounts).values({
-        id: `acc_${crypto.randomUUID()}`,
-        accountId: normalizedEmail,
-        providerId: 'credential',
-        userId: currentGuest.id,
-        password: passwordHash,
-      });
+      try {
+        await this.db.insert(accounts).values({
+          id: `acc_${crypto.randomUUID()}`,
+          accountId: normalizedEmail,
+          providerId: 'credential',
+          userId: currentGuest.id,
+          password: passwordHash,
+        });
+      } catch (err) {
+        // accounts INSERT 失敗時は users の更新をロールバックして破損アカウント化を防止
+        await this.db
+          .update(users)
+          .set({
+            name: currentGuest.name,
+            email: null,
+            isAnonymous: true,
+            settingsJson: currentGuest.settings,
+            updatedAt: new Date(),
+          })
+          .where(eq(users.id, currentGuest.id))
+          .catch(() => {});
+        throw err;
+      }
 
       return {
         user: toAuthUser(updated!),
@@ -291,21 +312,30 @@ export class NeonPostgisRepository implements SeichiRepository {
       })
       .returning();
 
-    await this.db.insert(accounts).values({
-      id: `acc_${crypto.randomUUID()}`,
-      accountId: normalizedEmail,
-      providerId: 'credential',
-      userId,
-      password: passwordHash,
-    });
-
     const token = `tok_${crypto.randomUUID()}${crypto.randomUUID().replace(/-/g, '')}`;
-    await this.db.insert(sessions).values({
-      id: `ses_${crypto.randomUUID()}`,
-      userId,
-      token,
-      expiresAt: new Date(Date.now() + 1000 * 60 * 60 * 24 * 90),
-    });
+    try {
+      await this.db.insert(accounts).values({
+        id: `acc_${crypto.randomUUID()}`,
+        accountId: normalizedEmail,
+        providerId: 'credential',
+        userId,
+        password: passwordHash,
+      });
+
+      await this.db.insert(sessions).values({
+        id: `ses_${crypto.randomUUID()}`,
+        userId,
+        token,
+        expiresAt: new Date(Date.now() + 1000 * 60 * 60 * 24 * 90),
+      });
+    } catch (err) {
+      // 後続 INSERT 失敗時は孤立 users レコードを削除（cascade）
+      await this.db
+        .delete(users)
+        .where(eq(users.id, userId))
+        .catch(() => {});
+      throw err;
+    }
 
     return { user: toAuthUser(created!), sessionToken: token };
   }
@@ -314,7 +344,11 @@ export class NeonPostgisRepository implements SeichiRepository {
     currentSessionToken?: string;
     email: string;
     password: string;
-  }): Promise<{ user: AuthUser; sessionToken: string }> {
+  }): Promise<{
+    user: AuthUser;
+    sessionToken: string;
+    r2KeysToDelete?: string[];
+  }> {
     const normalizedEmail = params.email.trim().toLowerCase();
     const found = await this.db
       .select({ user: users, account: accounts })
@@ -338,11 +372,13 @@ export class NeonPostgisRepository implements SeichiRepository {
       throw new Error('メールアドレスまたはパスワードが正しくありません');
     }
 
+    let r2KeysToDelete: string[] = [];
     const currentGuest = params.currentSessionToken
       ? await this.getUserBySessionToken(params.currentSessionToken)
       : null;
     if (currentGuest && currentGuest.isAnonymous && currentGuest.id !== row.user.id) {
-      await this.mergeAnonymousUserData(currentGuest.id, row.user.id);
+      const merged = await this.mergeAnonymousUserData(currentGuest.id, row.user.id);
+      r2KeysToDelete = merged.r2KeysToDelete;
     }
 
     const token = `tok_${crypto.randomUUID()}${crypto.randomUUID().replace(/-/g, '')}`;
@@ -353,7 +389,7 @@ export class NeonPostgisRepository implements SeichiRepository {
       expiresAt: new Date(Date.now() + 1000 * 60 * 60 * 24 * 90),
     });
 
-    return { user: toAuthUser(row.user), sessionToken: token };
+    return { user: toAuthUser(row.user), sessionToken: token, r2KeysToDelete };
   }
 
   public async signOutSession(token: string): Promise<void> {
@@ -683,6 +719,40 @@ export class NeonPostgisRepository implements SeichiRepository {
       .where(eq(spots.id, spotId))
       .returning({ id: spots.id });
     return { deleted: deletedRows.length > 0, r2KeysToDelete };
+  }
+
+  public async deleteEpisode(
+    spotId: string,
+    episodeId: string,
+  ): Promise<Spot | null> {
+    const existing = await this.getSpotById(spotId);
+    if (!existing) return null;
+    if (!existing.episodes.some((e) => e.id === episodeId)) return null;
+    if (existing.episodes.length <= 1) {
+      throw new Error(
+        '最後の1エピソードは個別削除できません（スポット自体を削除するか編集してください）',
+      );
+    }
+
+    await this.db
+      .delete(spotEpisodes)
+      .where(
+        and(eq(spotEpisodes.id, episodeId), eq(spotEpisodes.spotId, spotId)),
+      );
+    return this.getSpotById(spotId);
+  }
+
+  public async deleteComment(
+    spotId: string,
+    commentId: string,
+  ): Promise<boolean> {
+    const deletedRows = await this.db
+      .delete(spotComments)
+      .where(
+        and(eq(spotComments.id, commentId), eq(spotComments.spotId, spotId)),
+      )
+      .returning({ id: spotComments.id });
+    return deletedRows.length > 0;
   }
 
   public async bulkImportCandidates(
